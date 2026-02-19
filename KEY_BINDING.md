@@ -2,7 +2,7 @@
 
 ## Overview
 
-`src/keybindings.rs` provides a customizable, modular key binding system. Users can override any shortcut via `~/.cokacdir/settings.json`, and developers can extend the system to new screen contexts (Viewer, Editor, etc.) by reusing the generic `ActionMap<A>` infrastructure.
+`src/keybindings.rs` provides a customizable, modular key binding system. Users can override any shortcut via `~/.code-control-telegram/settings.json`, and developers can extend the system to new screen contexts (Viewer, Editor, etc.) by reusing the generic `ActionMap<A>` infrastructure.
 
 ## Architecture
 
@@ -92,7 +92,7 @@ Modifiers are joined with `+` before the key name. Order does not matter.
 
 ## User Configuration
 
-Add a `keybindings` section to `~/.cokacdir/settings.json`:
+Add a `keybindings` section to `~/.code-control-telegram/settings.json`:
 
 ```json
 {
@@ -292,4 +292,4 @@ The user can then customize it in `settings.json`:
 | `src/main.rs` | `handle_panel_input()` uses `app.keybindings.panel_action()` |
 | `src/ui/draw.rs` | Function bar uses `app.keybindings.panel_first_key()` for key display |
 | `src/ui/help.rs` | Help screen uses `app.keybindings.panel_keys_joined()` for key display |
-| `~/.cokacdir/settings.json` | User-editable keybinding overrides |
+| `~/.code-control-telegram/settings.json` | User-editable keybinding overrides |

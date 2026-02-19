@@ -1,16 +1,16 @@
 # Telegram Remote Control
 
-cokacdir의 AI 기능(`.` 단축키)을 텔레그램 Bot을 통해 원격으로 사용할 수 있도록 한다.
+code-control-telegram의 AI 기능(`.` 단축키)을 텔레그램 Bot을 통해 원격으로 사용할 수 있도록 한다.
 
 ## 개요
 
 - 텔레그램에서 `/start <path>` 로 세션을 시작
 - 텍스트를 보내면 Claude AI에 전달하여 응답을 스트리밍으로 받아온다
-- 기존 `~/.cokacdir/ai_sessions/` 세션 파일과 호환되어 TUI와 텔레그램 간 세션 공유가 가능
+- 기존 `~/.code-control-telegram/ai_sessions/` 세션 파일과 호환되어 TUI와 텔레그램 간 세션 공유가 가능
 
 ## CLI 명령어
 
-### `cokacdir --ccserver <TOKEN> [TOKEN2] ...`
+### `code-control-telegram --ccserver <TOKEN> [TOKEN2] ...`
 텔레그램 Bot 서버를 시작한다. 토큰을 인자로 직접 전달하며, Long Polling 방식으로 동작한다.
 여러 토큰을 전달하면 각각의 봇이 동시에 구동된다.
 

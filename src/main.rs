@@ -1,35 +1,38 @@
-mod ui;
-mod services;
-mod utils;
 mod config;
-mod keybindings;
 mod enc;
+mod keybindings;
+mod services;
+mod ui;
+mod utils;
 
-use std::io;
-use std::env;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use ratatui::{backend::CrosstermBackend, Terminal};
+use std::env;
+use std::io;
 use std::time::Duration;
-use ratatui::{
-    backend::CrosstermBackend,
-    Terminal,
-};
 
-use crate::ui::app::{App, Screen};
-use crate::services::claude;
-use crate::utils::markdown::{render_markdown, MarkdownTheme, is_line_empty};
 use crate::keybindings::PanelAction;
+use crate::services::claude;
+use crate::ui::app::{App, Screen};
+use crate::utils::markdown::{is_line_empty, render_markdown, MarkdownTheme};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn print_help() {
-    println!("cokacdir {} - Multi-panel terminal file manager", VERSION);
+    println!(
+        "code-control-telegram {} - Multi-panel terminal file manager",
+        VERSION
+    );
     println!();
     println!("USAGE:");
-    println!("    cokacdir [OPTIONS] [PATH...]");
+    println!("    code-control-telegram [OPTIONS] [PATH...]");
     println!();
     println!("ARGS:");
     println!("    [PATH...]               Open panels at given paths (max 10)");
@@ -44,11 +47,11 @@ fn print_help() {
     println!("    --sendfile <PATH> --chat <ID> --key <TOKEN>");
     println!("                            Send file via Telegram bot (internal use)");
     println!();
-    println!("HOMEPAGE: https://cokacdir.cokac.com");
+    println!("HOMEPAGE: https://github.com/shacea/code-control-telegram-miniapp");
 }
 
 fn handle_base64(encoded: &str) {
-    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     match BASE64.decode(encoded) {
         Ok(decoded) => {
             if let Ok(text) = String::from_utf8(decoded) {
@@ -73,10 +76,10 @@ fn handle_sendfile(path: &str, chat_id: i64, token: &str) {
             eprintln!("Error: file not found: {}", path);
             std::process::exit(1);
         }
-        match bot.send_document(
-            ChatId(chat_id),
-            teloxide::types::InputFile::file(file_path),
-        ).await {
+        match bot
+            .send_document(ChatId(chat_id), teloxide::types::InputFile::file(file_path))
+            .await
+        {
             Ok(_) => println!("File sent: {}", path),
             Err(e) => {
                 eprintln!("Failed to send file: {}", e);
@@ -87,13 +90,16 @@ fn handle_sendfile(path: &str, chat_id: i64, token: &str) {
 }
 
 fn print_version() {
-    println!("cokacdir {}", VERSION);
+    println!("code-control-telegram {}", VERSION);
 }
 
 fn handle_ccserver(tokens: Vec<String>) {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
-    let title = format!("  cokacdir v{}  |  Telegram Bot Server  ", VERSION);
+    let title = format!(
+        "  code-control-telegram v{}  |  Telegram Bot Server  ",
+        VERSION
+    );
     let width = title.chars().count();
     println!();
     println!("  ┌{}┐", "─".repeat(width));
@@ -142,7 +148,12 @@ fn handle_prompt(prompt: &str) {
     let response = claude::execute_command(prompt, None, &current_dir, None);
 
     if !response.success {
-        eprintln!("Error: {}", response.error.unwrap_or_else(|| "Unknown error".to_string()));
+        eprintln!(
+            "Error: {}",
+            response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string())
+        );
         return;
     }
 
@@ -166,9 +177,7 @@ fn handle_prompt(prompt: &str) {
             }
             prev_was_empty = true;
         } else {
-            let content: String = line.spans.iter()
-                .map(|s| s.content.as_ref())
-                .collect();
+            let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             println!("{}", content);
             prev_was_empty = false;
         }
@@ -217,7 +226,7 @@ fn main() -> io::Result<()> {
             "--prompt" => {
                 if i + 1 >= args.len() {
                     eprintln!("Error: --prompt requires a text argument");
-                    eprintln!("Usage: cokacdir --prompt \"your question\"");
+                    eprintln!("Usage: code-control-telegram --prompt \"your question\"");
                     return Ok(());
                 }
                 handle_prompt(&args[i + 1]);
@@ -231,13 +240,14 @@ fn main() -> io::Result<()> {
                 return Ok(());
             }
             "--ccserver" => {
-                let tokens: Vec<String> = args[i + 1..].iter()
+                let tokens: Vec<String> = args[i + 1..]
+                    .iter()
                     .filter(|a| !a.starts_with('-'))
                     .cloned()
                     .collect();
                 if tokens.is_empty() {
                     eprintln!("Error: --ccserver requires at least one token argument");
-                    eprintln!("Usage: cokacdir --ccserver <TOKEN> [TOKEN2] ...");
+                    eprintln!("Usage: code-control-telegram --ccserver <TOKEN> [TOKEN2] ...");
                     return Ok(());
                 }
                 handle_ccserver(tokens);
@@ -271,7 +281,9 @@ fn main() -> io::Result<()> {
                             file_path = Some(args[j].clone());
                             j += 1;
                         }
-                        _ => { j += 1; }
+                        _ => {
+                            j += 1;
+                        }
                     }
                 }
                 match (file_path, chat_id, key) {
@@ -279,8 +291,10 @@ fn main() -> io::Result<()> {
                         handle_sendfile(&fp, cid, &k);
                     }
                     _ => {
-                        eprintln!("Error: --sendfile requires <PATH>, --chat <ID>, and --key <TOKEN>");
-                        eprintln!("Usage: cokacdir --sendfile <PATH> --chat <ID> --key <TOKEN>");
+                        eprintln!(
+                            "Error: --sendfile requires <PATH>, --chat <ID>, and --key <TOKEN>"
+                        );
+                        eprintln!("Usage: code-control-telegram --sendfile <PATH> --chat <ID> --key <TOKEN>");
                     }
                 }
                 return Ok(());
@@ -299,7 +313,9 @@ fn main() -> io::Result<()> {
                 let resolved = if p.is_absolute() {
                     p
                 } else {
-                    env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")).join(p)
+                    env::current_dir()
+                        .unwrap_or_else(|_| std::path::PathBuf::from("/"))
+                        .join(p)
                 };
                 start_paths.push(resolved);
             }
@@ -410,7 +426,7 @@ fn print_goodbye_message() {
     // Check for updates
     check_for_updates();
 
-    println!("Thank you for using COKACDIR! 🙏");
+    println!("Thank you for using code-control-telegram! 🙏");
     println!();
     println!("If you found this useful, consider checking out my other content:");
     println!("  📺 YouTube: https://www.youtube.com/@코드깎는노인");
@@ -426,8 +442,9 @@ fn check_for_updates() {
     let output = std::process::Command::new("curl")
         .args([
             "-fsSL",
-            "--max-time", "3",
-            "https://raw.githubusercontent.com/kstost/cokacdir/refs/heads/main/Cargo.toml"
+            "--max-time",
+            "3",
+            "https://raw.githubusercontent.com/shacea/code-control-telegram-miniapp/refs/heads/main/Cargo.toml",
         ])
         .output();
 
@@ -441,12 +458,25 @@ fn check_for_updates() {
 
     if let Some(latest) = latest_version {
         if is_newer_version(&latest, current_version) {
-            println!("┌──────────────────────────────────────────────────────────────────────────┐");
-            println!("│  🚀 New version available: v{} (current: v{})                            ", latest, current_version);
-            println!("│                                                                          │");
-            println!("│  Update with:                                                            │");
-            println!("│  /bin/bash -c \"$(curl -fsSL https://cokacdir.cokac.com/install.sh)\"      │");
-            println!("└──────────────────────────────────────────────────────────────────────────┘");
+            println!(
+                "┌──────────────────────────────────────────────────────────────────────────┐"
+            );
+            println!(
+                "│  🚀 New version available: v{} (current: v{})                            ",
+                latest, current_version
+            );
+            println!(
+                "│                                                                          │"
+            );
+            println!(
+                "│  Update with:                                                            │"
+            );
+            println!(
+                "│  cargo install code-control-telegram                                      │"
+            );
+            println!(
+                "└──────────────────────────────────────────────────────────────────────────┘"
+            );
             println!();
         }
     }
@@ -470,11 +500,7 @@ fn parse_version_from_cargo_toml(content: &str) -> Option<String> {
 }
 
 fn is_newer_version(latest: &str, current: &str) -> bool {
-    let parse = |v: &str| -> Vec<u32> {
-        v.split('.')
-            .filter_map(|s| s.parse().ok())
-            .collect()
-    };
+    let parse = |v: &str| -> Vec<u32> { v.split('.').filter_map(|s| s.parse().ok()).collect() };
 
     let latest_parts = parse(latest);
     let current_parts = parse(current);
@@ -506,14 +532,31 @@ fn run_app<B: ratatui::backend::Backend>(
 
         // For AI screen, FileInfo with calculation, ImageViewer loading, diff comparing, file operation progress, or remote spinner, use fast polling
         let is_file_info_calculating = app.current_screen == Screen::FileInfo
-            && app.file_info_state.as_ref().map(|s| s.is_calculating).unwrap_or(false);
+            && app
+                .file_info_state
+                .as_ref()
+                .map(|s| s.is_calculating)
+                .unwrap_or(false);
         let is_image_loading = app.current_screen == Screen::ImageViewer
-            && app.image_viewer_state.as_ref().map(|s| s.is_loading).unwrap_or(false);
+            && app
+                .image_viewer_state
+                .as_ref()
+                .map(|s| s.is_loading)
+                .unwrap_or(false);
         let is_diff_comparing = app.current_screen == Screen::DiffScreen
-            && app.diff_state.as_ref().map(|s| s.is_comparing).unwrap_or(false);
+            && app
+                .diff_state
+                .as_ref()
+                .map(|s| s.is_comparing)
+                .unwrap_or(false);
         let is_dedup_active = app.current_screen == Screen::DedupScreen
-            && app.dedup_screen_state.as_ref().map(|s| !s.is_complete).unwrap_or(false);
-        let is_progress_active = app.file_operation_progress
+            && app
+                .dedup_screen_state
+                .as_ref()
+                .map(|s| !s.is_complete)
+                .unwrap_or(false);
+        let is_progress_active = app
+            .file_operation_progress
             .as_ref()
             .map(|p| p.is_active)
             .unwrap_or(false);
@@ -523,7 +566,12 @@ fn run_app<B: ratatui::backend::Backend>(
             Duration::from_millis(16) // ~60fps for smooth real-time updates
         } else if is_remote_spinner {
             Duration::from_millis(100) // Fast polling for spinner animation
-        } else if app.current_screen == Screen::AIScreen || app.is_ai_mode() || is_file_info_calculating || is_image_loading || is_diff_comparing {
+        } else if app.current_screen == Screen::AIScreen
+            || app.is_ai_mode()
+            || is_file_info_calculating
+            || is_image_loading
+            || is_diff_comparing
+        {
             Duration::from_millis(100) // Fast polling for spinner animation
         } else {
             Duration::from_millis(250)
@@ -586,13 +634,16 @@ fn run_app<B: ratatui::backend::Backend>(
         }
 
         // Poll for file operation progress
-        let progress_message: Option<String> = if let Some(ref mut progress) = app.file_operation_progress {
+        let progress_message: Option<String> = if let Some(ref mut progress) =
+            app.file_operation_progress
+        {
             let still_active = progress.poll();
             if !still_active {
                 // Operation completed - extract result info before releasing borrow
                 let msg = if let Some(ref result) = progress.result {
                     // Special handling for Tar - show archive name
-                    if progress.operation_type == crate::services::file_ops::FileOperationType::Tar {
+                    if progress.operation_type == crate::services::file_ops::FileOperationType::Tar
+                    {
                         if result.failure_count == 0 {
                             if let Some(ref archive_name) = app.pending_tar_archive {
                                 Some(format!("Created: {}", archive_name))
@@ -600,9 +651,14 @@ fn run_app<B: ratatui::backend::Backend>(
                                 Some(format!("Archived {} file(s)", result.success_count))
                             }
                         } else {
-                            Some(format!("Error: {}", result.last_error.as_deref().unwrap_or("Archive failed")))
+                            Some(format!(
+                                "Error: {}",
+                                result.last_error.as_deref().unwrap_or("Archive failed")
+                            ))
                         }
-                    } else if progress.operation_type == crate::services::file_ops::FileOperationType::Untar {
+                    } else if progress.operation_type
+                        == crate::services::file_ops::FileOperationType::Untar
+                    {
                         if result.failure_count == 0 {
                             if let Some(ref extract_dir) = app.pending_extract_dir {
                                 Some(format!("Extracted to: {}", extract_dir))
@@ -610,7 +666,10 @@ fn run_app<B: ratatui::backend::Backend>(
                                 Some(format!("Extracted {} file(s)", result.success_count))
                             }
                         } else {
-                            Some(format!("Error: {}", result.last_error.as_deref().unwrap_or("Extract failed")))
+                            Some(format!(
+                                "Error: {}",
+                                result.last_error.as_deref().unwrap_or("Extract failed")
+                            ))
                         }
                     } else {
                         let op_name = match progress.operation_type {
@@ -626,7 +685,8 @@ fn run_app<B: ratatui::backend::Backend>(
                         if result.failure_count == 0 {
                             Some(format!("{} {} file(s)", op_name, result.success_count))
                         } else {
-                            Some(format!("{} {}/{}. Error: {}",
+                            Some(format!(
+                                "{} {}/{}. Error: {}",
                                 op_name,
                                 result.success_count,
                                 total,
@@ -655,7 +715,9 @@ fn run_app<B: ratatui::backend::Backend>(
                 // tmp 파일 존재 확인으로 성공/실패 판단
                 let tmp_exists = match &pending {
                     crate::ui::app::PendingRemoteOpen::Editor { tmp_path, .. } => tmp_path.exists(),
-                    crate::ui::app::PendingRemoteOpen::ImageViewer { tmp_path } => tmp_path.exists(),
+                    crate::ui::app::PendingRemoteOpen::ImageViewer { tmp_path } => {
+                        tmp_path.exists()
+                    }
                 };
 
                 if !tmp_exists {
@@ -666,15 +728,20 @@ fn run_app<B: ratatui::backend::Backend>(
                     }
                 } else {
                     match pending {
-                        crate::ui::app::PendingRemoteOpen::Editor { tmp_path, panel_index, remote_path } => {
+                        crate::ui::app::PendingRemoteOpen::Editor {
+                            tmp_path,
+                            panel_index,
+                            remote_path,
+                        } => {
                             let mut editor = crate::ui::file_editor::EditorState::new();
                             editor.set_syntax_colors(app.theme.syntax);
                             match editor.load_file(&tmp_path) {
                                 Ok(_) => {
-                                    editor.remote_origin = Some(crate::ui::file_editor::RemoteEditOrigin {
-                                        panel_index,
-                                        remote_path,
-                                    });
+                                    editor.remote_origin =
+                                        Some(crate::ui::file_editor::RemoteEditOrigin {
+                                            panel_index,
+                                            remote_path,
+                                        });
                                     app.editor_state = Some(editor);
                                     app.current_screen = Screen::FileEditor;
                                 }
@@ -690,16 +757,16 @@ fn run_app<B: ratatui::backend::Backend>(
                                     dialog_type: crate::ui::app::DialogType::TrueColorWarning,
                                     input: String::new(),
                                     cursor_pos: 0,
-                                    message: "Terminal doesn't support true color. Open anyway?".to_string(),
+                                    message: "Terminal doesn't support true color. Open anyway?"
+                                        .to_string(),
                                     completion: None,
                                     selected_button: 1,
                                     selection: None,
                                     use_md5: false,
                                 });
                             } else {
-                                app.image_viewer_state = Some(
-                                    crate::ui::image_viewer::ImageViewerState::new(&tmp_path)
-                                );
+                                app.image_viewer_state =
+                                    Some(crate::ui::image_viewer::ImageViewerState::new(&tmp_path));
                                 app.current_screen = Screen::ImageViewer;
                             }
                         }
@@ -712,20 +779,35 @@ fn run_app<B: ratatui::backend::Backend>(
                 // Focus on created tar archive if applicable
                 if let Some(archive_name) = app.pending_tar_archive.take() {
                     app.refresh_panels();
-                    if let Some(idx) = app.active_panel().files.iter().position(|f| f.name == archive_name) {
+                    if let Some(idx) = app
+                        .active_panel()
+                        .files
+                        .iter()
+                        .position(|f| f.name == archive_name)
+                    {
                         app.active_panel_mut().selected_index = idx;
                     }
                 // Focus on extracted directory if applicable
                 } else if let Some(extract_dir) = app.pending_extract_dir.take() {
                     app.refresh_panels();
-                    if let Some(idx) = app.active_panel().files.iter().position(|f| f.name == extract_dir) {
+                    if let Some(idx) = app
+                        .active_panel()
+                        .files
+                        .iter()
+                        .position(|f| f.name == extract_dir)
+                    {
                         app.active_panel_mut().selected_index = idx;
                     }
                 // Focus on first pasted file (by panel's sorted order) if applicable
                 } else if let Some(paste_names) = app.pending_paste_focus.take() {
                     app.refresh_panels();
                     // Find the first file in the panel's sorted list that matches any pasted name
-                    if let Some(idx) = app.active_panel().files.iter().position(|f| paste_names.contains(&f.name)) {
+                    if let Some(idx) = app
+                        .active_panel()
+                        .files
+                        .iter()
+                        .position(|f| paste_names.contains(&f.name))
+                    {
                         app.active_panel_mut().selected_index = idx;
                     }
                 } else {
@@ -776,7 +858,12 @@ fn run_app<B: ratatui::backend::Backend>(
                         }
                         Screen::AIScreen => {
                             if let Some(ref mut state) = app.ai_state {
-                                if ui::ai_screen::handle_input(state, key.code, key.modifiers, &app.keybindings) {
+                                if ui::ai_screen::handle_input(
+                                    state,
+                                    key.code,
+                                    key.modifiers,
+                                    &app.keybindings,
+                                ) {
                                     // Save session to file before leaving
                                     state.save_session_to_file();
                                     app.current_screen = Screen::FilePanel;
@@ -787,7 +874,12 @@ fn run_app<B: ratatui::backend::Backend>(
                             }
                         }
                         Screen::SystemInfo => {
-                            if ui::system_info::handle_input(&mut app.system_info_state, key.code, key.modifiers, &app.keybindings) {
+                            if ui::system_info::handle_input(
+                                &mut app.system_info_state,
+                                key.code,
+                                key.modifiers,
+                                &app.keybindings,
+                            ) {
                                 app.current_screen = Screen::FilePanel;
                             }
                         }
@@ -846,14 +938,19 @@ fn run_app<B: ratatui::backend::Backend>(
                         }
                         Screen::FilePanel => {
                             // AI mode with focus on AI panel
-                            if app.is_ai_mode() && app.ai_panel_index == Some(app.active_panel_index) {
+                            if app.is_ai_mode()
+                                && app.ai_panel_index == Some(app.active_panel_index)
+                            {
                                 if let Some(ref mut state) = app.ai_state {
                                     ui::ai_screen::handle_paste(state, &text);
                                 }
                             } else if app.dialog.is_some() {
                                 ui::dialogs::handle_paste(app, &text);
                             } else if app.advanced_search_state.active {
-                                ui::advanced_search::handle_paste(&mut app.advanced_search_state, &text);
+                                ui::advanced_search::handle_paste(
+                                    &mut app.advanced_search_state,
+                                    &text,
+                                );
                             }
                         }
                         Screen::FileEditor => {
@@ -904,7 +1001,12 @@ fn handle_panel_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
 
     // Handle advanced search dialog first
     if app.advanced_search_state.active {
-        if let Some(criteria) = ui::advanced_search::handle_input(&mut app.advanced_search_state, code, modifiers, &app.keybindings) {
+        if let Some(criteria) = ui::advanced_search::handle_input(
+            &mut app.advanced_search_state,
+            code,
+            modifiers,
+            &app.keybindings,
+        ) {
             app.execute_advanced_search(&criteria);
         }
         return false;
@@ -914,7 +1016,6 @@ fn handle_panel_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
     if app.dialog.is_some() {
         return ui::dialogs::handle_dialog_input(app, code, modifiers);
     }
-
 
     // Look up action from keybindings
     if let Some(action) = app.keybindings.panel_action(code, modifiers) {
