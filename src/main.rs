@@ -94,6 +94,10 @@ fn print_version() {
 }
 
 fn handle_ccserver(tokens: Vec<String>) {
+    // Ensure config + state directory exists and migrate legacy directory if present.
+    // This is important for ccserver mode because it relies on bot_settings.json and ai_sessions.
+    config::Settings::ensure_config_exists();
+
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
     let title = format!(
