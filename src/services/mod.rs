@@ -1,6 +1,7 @@
 pub mod claude;
 pub mod dedup;
 pub mod file_ops;
+pub mod miniapp;
 pub mod opencode;
 pub mod process;
 pub mod remote;
