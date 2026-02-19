@@ -8,7 +8,7 @@ use std::sync::Arc;
 use reqwest::Url;
 use sha2::{Digest, Sha256};
 use teloxide::prelude::*;
-use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, WebAppInfo};
+use teloxide::types::{ButtonRequest, KeyboardButton, KeyboardMarkup, ParseMode, WebAppInfo};
 use tokio::sync::Mutex;
 
 use crate::services::claude::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_TOOLS};
@@ -429,10 +429,11 @@ async fn handle_app_command(bot: &Bot, chat_id: ChatId, state: &SharedState) -> 
         }
     };
 
-    let keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::web_app(
-        "Open Mini App".to_string(),
-        WebAppInfo { url },
-    )]]);
+    let keyboard = KeyboardMarkup::new(vec![vec![
+        KeyboardButton::new("Open Mini App").request(ButtonRequest::WebApp(WebAppInfo { url }))
+    ]])
+    .resize_keyboard()
+    .one_time_keyboard();
 
     bot.send_message(chat_id, "Open the Mini App to choose engine + folder.")
         .reply_markup(keyboard)
