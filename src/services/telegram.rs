@@ -1,26 +1,37 @@
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::path::Path;
-use std::fs;
 
-use tokio::sync::Mutex;
+use sha2::{Digest, Sha256};
 use teloxide::prelude::*;
 use teloxide::types::ParseMode;
-use sha2::{Sha256, Digest};
+use tokio::sync::Mutex;
 
 use crate::services::claude::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_TOOLS};
+use crate::services::opencode;
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Engine {
+    Claude,
+    OpenCode,
+}
 
 /// Per-chat session state
 struct ChatSession {
+    engine: Engine,
     session_id: Option<String>,
     current_path: Option<String>,
     history: Vec<HistoryItem>,
-    /// File upload records not yet sent to Claude AI.
-    /// Drained and prepended to the next user prompt so Claude knows about uploaded files.
+    /// File upload records not yet sent to the agent.
+    /// Drained and prepended to the next user prompt so it knows about uploaded files.
     pending_uploads: Vec<String>,
+    /// OpenCode server state (Option B: serve + attach)
+    opencode_server_url: Option<String>,
+    opencode_server_pid: Option<u32>,
 }
 
 /// Bot-level settings persisted to disk
@@ -34,7 +45,10 @@ struct BotSettings {
 impl Default for BotSettings {
     fn default() -> Self {
         Self {
-            allowed_tools: DEFAULT_ALLOWED_TOOLS.iter().map(|s| s.to_string()).collect(),
+            allowed_tools: DEFAULT_ALLOWED_TOOLS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             last_sessions: HashMap::new(),
         }
     }
@@ -93,7 +107,8 @@ fn load_bot_settings(token: &str) -> BotSettings {
     if tools.is_empty() {
         return BotSettings::default();
     }
-    let last_sessions = entry.get("last_sessions")
+    let last_sessions = entry
+        .get("last_sessions")
         .and_then(|v| v.as_object())
         .map(|obj| {
             obj.iter()
@@ -101,12 +116,17 @@ fn load_bot_settings(token: &str) -> BotSettings {
                 .collect()
         })
         .unwrap_or_default();
-    BotSettings { allowed_tools: tools, last_sessions }
+    BotSettings {
+        allowed_tools: tools,
+        last_sessions,
+    }
 }
 
 /// Save bot settings to bot_settings.json
 fn save_bot_settings(token: &str, settings: &BotSettings) {
-    let Some(path) = bot_settings_path() else { return };
+    let Some(path) = bot_settings_path() else {
+        return;
+    };
     // Ensure directory exists
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -139,31 +159,48 @@ fn normalize_tool_name(name: &str) -> String {
 
 /// All available tools with (description, is_destructive)
 const ALL_TOOLS: &[(&str, &str, bool)] = &[
-    ("Bash",            "Execute shell commands",                          true),
-    ("Read",            "Read file contents from the filesystem",          false),
-    ("Edit",            "Perform find-and-replace edits in files",         true),
-    ("Write",           "Create or overwrite files",                       true),
-    ("Glob",            "Find files by name pattern",                      false),
-    ("Grep",            "Search file contents with regex",                 false),
-    ("Task",            "Launch autonomous sub-agents for complex tasks",  true),
-    ("TaskOutput",      "Retrieve output from background tasks",           false),
-    ("TaskStop",        "Stop a running background task",                  false),
-    ("WebFetch",        "Fetch and process web page content",              true),
-    ("WebSearch",       "Search the web for up-to-date information",       true),
-    ("NotebookEdit",    "Edit Jupyter notebook cells",                     true),
-    ("Skill",           "Invoke slash-command skills",                     false),
-    ("TaskCreate",      "Create a structured task in the task list",       false),
-    ("TaskGet",         "Retrieve task details by ID",                     false),
-    ("TaskUpdate",      "Update task status or details",                   false),
-    ("TaskList",        "List all tasks and their status",                 false),
-    ("AskUserQuestion", "Ask the user a question (interactive)",           false),
-    ("EnterPlanMode",   "Enter planning mode (interactive)",               false),
-    ("ExitPlanMode",    "Exit planning mode (interactive)",                false),
+    ("Bash", "Execute shell commands", true),
+    ("Read", "Read file contents from the filesystem", false),
+    ("Edit", "Perform find-and-replace edits in files", true),
+    ("Write", "Create or overwrite files", true),
+    ("Glob", "Find files by name pattern", false),
+    ("Grep", "Search file contents with regex", false),
+    (
+        "Task",
+        "Launch autonomous sub-agents for complex tasks",
+        true,
+    ),
+    ("TaskOutput", "Retrieve output from background tasks", false),
+    ("TaskStop", "Stop a running background task", false),
+    ("WebFetch", "Fetch and process web page content", true),
+    (
+        "WebSearch",
+        "Search the web for up-to-date information",
+        true,
+    ),
+    ("NotebookEdit", "Edit Jupyter notebook cells", true),
+    ("Skill", "Invoke slash-command skills", false),
+    (
+        "TaskCreate",
+        "Create a structured task in the task list",
+        false,
+    ),
+    ("TaskGet", "Retrieve task details by ID", false),
+    ("TaskUpdate", "Update task status or details", false),
+    ("TaskList", "List all tasks and their status", false),
+    (
+        "AskUserQuestion",
+        "Ask the user a question (interactive)",
+        false,
+    ),
+    ("EnterPlanMode", "Enter planning mode (interactive)", false),
+    ("ExitPlanMode", "Exit planning mode (interactive)", false),
 ];
 
 /// Tool info: (description, is_destructive)
 fn tool_info(name: &str) -> (&'static str, bool) {
-    ALL_TOOLS.iter()
+    ALL_TOOLS
+        .iter()
         .find(|(n, _, _)| *n == name)
         .map(|(_, desc, destr)| (*desc, *destr))
         .unwrap_or(("Custom tool", false))
@@ -171,7 +208,11 @@ fn tool_info(name: &str) -> (&'static str, bool) {
 
 /// Format a risk badge for display
 fn risk_badge(destructive: bool) -> &'static str {
-    if destructive { "!!!" } else { "" }
+    if destructive {
+        "!!!"
+    } else {
+        ""
+    }
 }
 
 /// Entry point: start the Telegram bot with long polling
@@ -192,9 +233,7 @@ pub async fn run_bot(token: &str) {
     teloxide::repl(bot, move |bot: Bot, msg: Message| {
         let state = shared_state.clone();
         let token = token_owned.clone();
-        async move {
-            handle_message(bot, msg, state, &token).await
-        }
+        async move { handle_message(bot, msg, state, &token).await }
     })
     .await;
 }
@@ -207,15 +246,24 @@ async fn handle_message(
     token: &str,
 ) -> ResponseResult<()> {
     let chat_id = msg.chat.id;
-    let user_name = msg.from.as_ref()
+    let user_name = msg
+        .from
+        .as_ref()
         .map(|u| u.first_name.as_str())
         .unwrap_or("unknown");
     let timestamp = chrono::Local::now().format("%H:%M:%S");
 
     // Handle file/photo uploads
     if msg.document().is_some() || msg.photo().is_some() {
-        let file_hint = if msg.document().is_some() { "document" } else { "photo" };
-        let caption_hint = msg.caption().map(|c| format!(" + caption: \"{}\"", truncate_str(c, 40))).unwrap_or_default();
+        let file_hint = if msg.document().is_some() {
+            "document"
+        } else {
+            "photo"
+        };
+        let caption_hint = msg
+            .caption()
+            .map(|c| format!(" + caption: \"{}\"", truncate_str(c, 40)))
+            .unwrap_or_default();
         println!("  [{timestamp}] ◀ [{user_name}] Upload: {file_hint}{caption_hint}");
         let result = handle_file_upload(&bot, chat_id, &msg, &state).await;
         println!("  [{timestamp}] ▶ [{user_name}] Upload complete");
@@ -233,14 +281,22 @@ async fn handle_message(
     if !text.starts_with("/start") {
         let mut data = state.lock().await;
         if !data.sessions.contains_key(&chat_id) {
-            if let Some(last_path) = data.settings.last_sessions.get(&chat_id.0.to_string()).cloned() {
+            if let Some(last_path) = data
+                .settings
+                .last_sessions
+                .get(&chat_id.0.to_string())
+                .cloned()
+            {
                 if Path::new(&last_path).is_dir() {
                     let existing = load_existing_session(&last_path);
                     let session = data.sessions.entry(chat_id).or_insert_with(|| ChatSession {
+                        engine: Engine::Claude,
                         session_id: None,
                         current_path: None,
                         history: Vec::new(),
                         pending_uploads: Vec::new(),
+                        opencode_server_url: None,
+                        opencode_server_pid: None,
                     });
                     session.current_path = Some(last_path.clone());
                     if let Some((session_data, _)) = existing {
@@ -278,11 +334,20 @@ async fn handle_message(
         println!("  [{timestamp}] ◀ [{user_name}] /clear");
         handle_clear_command(&bot, chat_id, &state).await?;
         println!("  [{timestamp}] ▶ [{user_name}] Session cleared");
+    } else if text.starts_with("/engine") {
+        println!("  [{timestamp}] ◀ [{user_name}] /engine");
+        handle_engine_command(&bot, chat_id, &text, &state).await?;
+    } else if text.starts_with("/end") {
+        println!("  [{timestamp}] ◀ [{user_name}] /end");
+        handle_end_command(&bot, chat_id, &state).await?;
     } else if text.starts_with("/pwd") {
         println!("  [{timestamp}] ◀ [{user_name}] /pwd");
         handle_pwd_command(&bot, chat_id, &state).await?;
     } else if text.starts_with("/down") {
-        println!("  [{timestamp}] ◀ [{user_name}] /down {}", text.strip_prefix("/down").unwrap_or("").trim());
+        println!(
+            "  [{timestamp}] ◀ [{user_name}] /down {}",
+            text.strip_prefix("/down").unwrap_or("").trim()
+        );
         handle_down_command(&bot, chat_id, &text, &state).await?;
     } else if text.starts_with("/availabletools") {
         println!("  [{timestamp}] ◀ [{user_name}] /availabletools");
@@ -291,7 +356,10 @@ async fn handle_message(
         println!("  [{timestamp}] ◀ [{user_name}] /allowedtools");
         handle_allowedtools_command(&bot, chat_id, &state).await?;
     } else if text.starts_with("/allowed") {
-        println!("  [{timestamp}] ◀ [{user_name}] /allowed {}", text.strip_prefix("/allowed").unwrap_or("").trim());
+        println!(
+            "  [{timestamp}] ◀ [{user_name}] /allowed {}",
+            text.strip_prefix("/allowed").unwrap_or("").trim()
+        );
         handle_allowed_command(&bot, chat_id, &text, &state, token).await?;
     } else if text.starts_with('!') {
         println!("  [{timestamp}] ◀ [{user_name}] Shell: {preview}");
@@ -306,20 +374,20 @@ async fn handle_message(
 }
 
 /// Handle /help command
-async fn handle_help_command(
-    bot: &Bot,
-    chat_id: ChatId,
-) -> ResponseResult<()> {
+async fn handle_help_command(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
     let help = "\
 <b>cokacdir Telegram Bot</b>
-Manage server files &amp; chat with Claude AI.
+Manage server files &amp; chat with AI (Claude / OpenCode).
 
 <b>Session</b>
 <code>/start &lt;path&gt;</code> — Start session at directory
 <code>/start</code> — Start with auto-generated workspace
+<code>/engine claude</code> — Use Claude CLI backend
+<code>/engine opencode</code> — Use OpenCode backend (serve + attach)
 <code>/pwd</code> — Show current working directory
 <code>/clear</code> — Clear AI conversation history
 <code>/stop</code> — Stop current AI request
+<code>/end</code> — End session (also stops OpenCode server if running)
 
 <b>File Transfer</b>
 <code>/down &lt;file&gt;</code> — Download file from server
@@ -384,7 +452,9 @@ async fn handle_start_command(
         // Expand ~ to home directory
         let expanded = if path_str.starts_with("~/") || path_str == "~" {
             if let Some(home) = dirs::home_dir() {
-                home.join(path_str.strip_prefix("~/").unwrap_or("")).display().to_string()
+                home.join(path_str.strip_prefix("~/").unwrap_or(""))
+                    .display()
+                    .to_string()
             } else {
                 path_str.to_string()
             }
@@ -394,8 +464,11 @@ async fn handle_start_command(
         // Validate path exists
         let path = Path::new(&expanded);
         if !path.exists() || !path.is_dir() {
-            bot.send_message(chat_id, format!("Error: '{}' is not a valid directory.", expanded))
-                .await?;
+            bot.send_message(
+                chat_id,
+                format!("Error: '{}' is not a valid directory.", expanded),
+            )
+            .await?;
             return Ok(());
         }
         path.canonicalize()
@@ -411,10 +484,13 @@ async fn handle_start_command(
     {
         let mut data = state.lock().await;
         let session = data.sessions.entry(chat_id).or_insert_with(|| ChatSession {
+            engine: Engine::Claude,
             session_id: None,
             current_path: None,
             history: Vec::new(),
             pending_uploads: Vec::new(),
+            opencode_server_url: None,
+            opencode_server_pid: None,
         });
 
         if let Some((session_data, _)) = &existing {
@@ -441,7 +517,11 @@ async fn handle_start_command(
                 };
                 // Truncate long items for display
                 let content: String = item.content.chars().take(200).collect();
-                let truncated = if item.content.chars().count() > 200 { "..." } else { "" };
+                let truncated = if item.content.chars().count() > 200 {
+                    "..."
+                } else {
+                    ""
+                };
                 response_lines.push(format!("[{}] {}{}", prefix, content, truncated));
             }
         } else {
@@ -458,7 +538,9 @@ async fn handle_start_command(
     // Persist chat_id → path mapping for auto-restore after restart
     {
         let mut data = state.lock().await;
-        data.settings.last_sessions.insert(chat_id.0.to_string(), canonical_path);
+        data.settings
+            .last_sessions
+            .insert(chat_id.0.to_string(), canonical_path);
         save_bot_settings(token, &data.settings);
     }
 
@@ -482,26 +564,100 @@ async fn handle_clear_command(
         }
     }
 
-    bot.send_message(chat_id, "Session cleared.")
-        .await?;
+    bot.send_message(chat_id, "Session cleared.").await?;
 
     Ok(())
 }
 
-/// Handle /pwd command - show current session path
-async fn handle_pwd_command(
+/// Handle /engine command - select backend engine
+async fn handle_engine_command(
     bot: &Bot,
     chat_id: ChatId,
+    text: &str,
     state: &SharedState,
 ) -> ResponseResult<()> {
+    let arg = text
+        .strip_prefix("/engine")
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    let engine = match arg.as_str() {
+        "claude" => Engine::Claude,
+        "opencode" => Engine::OpenCode,
+        _ => {
+            bot.send_message(chat_id, "Usage: /engine claude | /engine opencode")
+                .await?;
+            return Ok(());
+        }
+    };
+
+    {
+        let mut data = state.lock().await;
+        let session = data.sessions.entry(chat_id).or_insert_with(|| ChatSession {
+            engine: Engine::Claude,
+            session_id: None,
+            current_path: None,
+            history: Vec::new(),
+            pending_uploads: Vec::new(),
+            opencode_server_url: None,
+            opencode_server_pid: None,
+        });
+        session.engine = engine;
+    }
+
+    let msg = match engine {
+        Engine::Claude => "Engine set to Claude CLI.",
+        Engine::OpenCode => "Engine set to OpenCode (serve + attach).",
+    };
+    bot.send_message(chat_id, msg).await?;
+    Ok(())
+}
+
+/// Handle /end command - end session and stop OpenCode server if running
+async fn handle_end_command(bot: &Bot, chat_id: ChatId, state: &SharedState) -> ResponseResult<()> {
+    let (pid_opt, url_opt) = {
+        let mut data = state.lock().await;
+        if let Some(session) = data.sessions.get_mut(&chat_id) {
+            let pid = session.opencode_server_pid.take();
+            let url = session.opencode_server_url.take();
+            session.session_id = None;
+            session.current_path = None;
+            session.history.clear();
+            session.pending_uploads.clear();
+            (pid, url)
+        } else {
+            (None, None)
+        }
+    };
+
+    if let Some(pid) = pid_opt {
+        opencode::stop_server(pid);
+    }
+
+    let msg = if let Some(url) = url_opt {
+        format!("Session ended. OpenCode server stopped ({}).", url)
+    } else {
+        "Session ended.".to_string()
+    };
+    bot.send_message(chat_id, msg).await?;
+    Ok(())
+}
+
+/// Handle /pwd command - show current session path
+async fn handle_pwd_command(bot: &Bot, chat_id: ChatId, state: &SharedState) -> ResponseResult<()> {
     let current_path = {
         let data = state.lock().await;
-        data.sessions.get(&chat_id).and_then(|s| s.current_path.clone())
+        data.sessions
+            .get(&chat_id)
+            .and_then(|s| s.current_path.clone())
     };
 
     match current_path {
         Some(path) => bot.send_message(chat_id, &path).await?,
-        None => bot.send_message(chat_id, "No active session. Use /start <path> first.").await?,
+        None => {
+            bot.send_message(chat_id, "No active session. Use /start <path> first.")
+                .await?
+        }
     };
 
     Ok(())
@@ -570,8 +726,11 @@ async fn handle_down_command(
     let file_path = text.strip_prefix("/down").unwrap_or("").trim();
 
     if file_path.is_empty() {
-        bot.send_message(chat_id, "Usage: /down <filepath>\nExample: /down /home/kst/file.txt")
-            .await?;
+        bot.send_message(
+            chat_id,
+            "Usage: /down <filepath>\nExample: /down /home/kst/file.txt",
+        )
+        .await?;
         return Ok(());
     }
 
@@ -581,13 +740,18 @@ async fn handle_down_command(
     } else {
         let current_path = {
             let data = state.lock().await;
-            data.sessions.get(&chat_id).and_then(|s| s.current_path.clone())
+            data.sessions
+                .get(&chat_id)
+                .and_then(|s| s.current_path.clone())
         };
         match current_path {
             Some(base) => format!("{}/{}", base.trim_end_matches('/'), file_path),
             None => {
-                bot.send_message(chat_id, "No active session. Use absolute path or /start <path> first.")
-                    .await?;
+                bot.send_message(
+                    chat_id,
+                    "No active session. Use absolute path or /start <path> first.",
+                )
+                .await?;
                 return Ok(());
             }
         }
@@ -595,11 +759,13 @@ async fn handle_down_command(
 
     let path = Path::new(&resolved_path);
     if !path.exists() {
-        bot.send_message(chat_id, &format!("File not found: {}", resolved_path)).await?;
+        bot.send_message(chat_id, &format!("File not found: {}", resolved_path))
+            .await?;
         return Ok(());
     }
     if !path.is_file() {
-        bot.send_message(chat_id, &format!("Not a file: {}", resolved_path)).await?;
+        bot.send_message(chat_id, &format!("Not a file: {}", resolved_path))
+            .await?;
         return Ok(());
     }
 
@@ -621,7 +787,9 @@ async fn handle_file_upload(
     // Get current session path
     let current_path = {
         let data = state.lock().await;
-        data.sessions.get(&chat_id).and_then(|s| s.current_path.clone())
+        data.sessions
+            .get(&chat_id)
+            .and_then(|s| s.current_path.clone())
     };
 
     let Some(save_dir) = current_path else {
@@ -632,7 +800,10 @@ async fn handle_file_upload(
 
     // Get file_id and file_name
     let (file_id, file_name) = if let Some(doc) = msg.document() {
-        let name = doc.file_name.clone().unwrap_or_else(|| "uploaded_file".to_string());
+        let name = doc
+            .file_name
+            .clone()
+            .unwrap_or_else(|| "uploaded_file".to_string());
         (doc.file.id.clone(), name)
     } else if let Some(photos) = msg.photo() {
         // Get the largest photo
@@ -648,17 +819,23 @@ async fn handle_file_upload(
 
     // Download file from Telegram via HTTP
     let file = bot.get_file(&file_id).await?;
-    let url = format!("https://api.telegram.org/file/bot{}/{}", bot.token(), file.path);
+    let url = format!(
+        "https://api.telegram.org/file/bot{}/{}",
+        bot.token(),
+        file.path
+    );
     let buf = match reqwest::get(&url).await {
         Ok(resp) => match resp.bytes().await {
             Ok(bytes) => bytes,
             Err(e) => {
-                bot.send_message(chat_id, &format!("Download failed: {}", e)).await?;
+                bot.send_message(chat_id, &format!("Download failed: {}", e))
+                    .await?;
                 return Ok(());
             }
         },
         Err(e) => {
-            bot.send_message(chat_id, &format!("Download failed: {}", e)).await?;
+            bot.send_message(chat_id, &format!("Download failed: {}", e))
+                .await?;
             return Ok(());
         }
     };
@@ -672,7 +849,8 @@ async fn handle_file_upload(
             bot.send_message(chat_id, &msg_text).await?;
         }
         Err(e) => {
-            bot.send_message(chat_id, &format!("Failed to save file: {}", e)).await?;
+            bot.send_message(chat_id, &format!("Failed to save file: {}", e))
+                .await?;
             return Ok(());
         }
     }
@@ -680,7 +858,9 @@ async fn handle_file_upload(
     // Record upload in session history and pending queue for Claude
     let upload_record = format!(
         "[File uploaded] {} → {} ({} bytes)",
-        file_name, dest.display(), file_size
+        file_name,
+        dest.display(),
+        file_size
     );
     {
         let mut data = state.lock().await;
@@ -717,15 +897,19 @@ async fn handle_shell_command(
     let cmd_str = text.strip_prefix('!').unwrap_or("").trim();
 
     if cmd_str.is_empty() {
-        bot.send_message(chat_id, "Usage: !<command>\nExample: !mkdir /home/kst/testcode")
-            .await?;
+        bot.send_message(
+            chat_id,
+            "Usage: !<command>\nExample: !mkdir /home/kst/testcode",
+        )
+        .await?;
         return Ok(());
     }
 
     // Get current_path for working directory (default to home directory)
     let working_dir = {
         let data = state.lock().await;
-        data.sessions.get(&chat_id)
+        data.sessions
+            .get(&chat_id)
             .and_then(|s| s.current_path.clone())
             .unwrap_or_else(|| {
                 dirs::home_dir()
@@ -751,7 +935,8 @@ async fn handle_shell_command(
             Ok(child) => child.wait_with_output(),
             Err(e) => Err(e),
         }
-    }).await;
+    })
+    .await;
 
     let response = match result {
         Ok(Ok(output)) => {
@@ -765,7 +950,10 @@ async fn handle_shell_command(
                 parts.push(format!("<pre>{}</pre>", html_escape(stdout.trim_end())));
             }
             if !stderr.is_empty() {
-                parts.push(format!("stderr:\n<pre>{}</pre>", html_escape(stderr.trim_end())));
+                parts.push(format!(
+                    "stderr:\n<pre>{}</pre>",
+                    html_escape(stderr.trim_end())
+                ));
             }
             if parts.is_empty() {
                 parts.push(format!("(exit code: {})", exit_code));
@@ -785,21 +973,31 @@ async fn handle_shell_command(
 }
 
 /// Handle /availabletools command - show all available tools
-async fn handle_availabletools_command(
-    bot: &Bot,
-    chat_id: ChatId,
-) -> ResponseResult<()> {
+async fn handle_availabletools_command(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
     let mut msg = String::from("<b>Available Tools</b>\n\n");
 
     for &(name, desc, destructive) in ALL_TOOLS {
         let badge = risk_badge(destructive);
         if badge.is_empty() {
-            msg.push_str(&format!("<code>{}</code> — {}\n", html_escape(name), html_escape(desc)));
+            msg.push_str(&format!(
+                "<code>{}</code> — {}\n",
+                html_escape(name),
+                html_escape(desc)
+            ));
         } else {
-            msg.push_str(&format!("<code>{}</code> {} — {}\n", html_escape(name), badge, html_escape(desc)));
+            msg.push_str(&format!(
+                "<code>{}</code> {} — {}\n",
+                html_escape(name),
+                badge,
+                html_escape(desc)
+            ));
         }
     }
-    msg.push_str(&format!("\n{} = destructive\nTotal: {}", risk_badge(true), ALL_TOOLS.len()));
+    msg.push_str(&format!(
+        "\n{} = destructive\nTotal: {}",
+        risk_badge(true),
+        ALL_TOOLS.len()
+    ));
 
     send_long_message(bot, chat_id, &msg, Some(ParseMode::Html)).await?;
 
@@ -822,12 +1020,25 @@ async fn handle_allowedtools_command(
         let (desc, destructive) = tool_info(tool);
         let badge = risk_badge(destructive);
         if badge.is_empty() {
-            msg.push_str(&format!("<code>{}</code> — {}\n", html_escape(tool), html_escape(desc)));
+            msg.push_str(&format!(
+                "<code>{}</code> — {}\n",
+                html_escape(tool),
+                html_escape(desc)
+            ));
         } else {
-            msg.push_str(&format!("<code>{}</code> {} — {}\n", html_escape(tool), badge, html_escape(desc)));
+            msg.push_str(&format!(
+                "<code>{}</code> {} — {}\n",
+                html_escape(tool),
+                badge,
+                html_escape(desc)
+            ));
         }
     }
-    msg.push_str(&format!("\n{} = destructive\nTotal: {}", risk_badge(true), tools.len()));
+    msg.push_str(&format!(
+        "\n{} = destructive\nTotal: {}",
+        risk_badge(true),
+        tools.len()
+    ));
 
     bot.send_message(chat_id, &msg)
         .parse_mode(ParseMode::Html)
@@ -865,8 +1076,11 @@ async fn handle_allowed_command(
     } else if let Some(name) = arg.strip_prefix('-') {
         ('-', name.trim())
     } else {
-        bot.send_message(chat_id, "Use +toolname to add or -toolname to remove.\nExample: /allowed +Bash")
-            .await?;
+        bot.send_message(
+            chat_id,
+            "Use +toolname to add or -toolname to remove.\nExample: /allowed +Bash",
+        )
+        .await?;
         return Ok(());
     };
 
@@ -883,7 +1097,10 @@ async fn handle_allowed_command(
         match op {
             '+' => {
                 if data.settings.allowed_tools.iter().any(|t| t == &tool_name) {
-                    format!("<code>{}</code> is already in the list.", html_escape(&tool_name))
+                    format!(
+                        "<code>{}</code> is already in the list.",
+                        html_escape(&tool_name)
+                    )
                 } else {
                     data.settings.allowed_tools.push(tool_name.clone());
                     save_bot_settings(token, &data.settings);
@@ -897,7 +1114,10 @@ async fn handle_allowed_command(
                     save_bot_settings(token, &data.settings);
                     format!("❌ Removed <code>{}</code>", html_escape(&tool_name))
                 } else {
-                    format!("<code>{}</code> is not in the list.", html_escape(&tool_name))
+                    format!(
+                        "<code>{}</code> is not in the list.",
+                        html_escape(&tool_name)
+                    )
                 }
             }
             _ => unreachable!(),
@@ -919,19 +1139,33 @@ async fn handle_text_message(
     state: &SharedState,
 ) -> ResponseResult<()> {
     // Get session info, allowed tools, and pending uploads (drop lock before any await)
-    let (session_info, allowed_tools, pending_uploads) = {
+    let (engine, session_info, allowed_tools, pending_uploads, opencode_server_url) = {
         let mut data = state.lock().await;
+        let engine = data
+            .sessions
+            .get(&chat_id)
+            .map(|s| s.engine)
+            .unwrap_or(Engine::Claude);
         let info = data.sessions.get(&chat_id).and_then(|session| {
             session.current_path.as_ref().map(|_| {
-                (session.session_id.clone(), session.current_path.clone().unwrap_or_default())
+                (
+                    session.session_id.clone(),
+                    session.current_path.clone().unwrap_or_default(),
+                )
             })
         });
         let tools = data.settings.allowed_tools.clone();
-        // Drain pending uploads so they are sent to Claude exactly once
-        let uploads = data.sessions.get_mut(&chat_id)
+        // Drain pending uploads so they are sent to the agent exactly once
+        let uploads = data
+            .sessions
+            .get_mut(&chat_id)
             .map(|s| std::mem::take(&mut s.pending_uploads))
             .unwrap_or_default();
-        (info, tools, uploads)
+        let server_url = data
+            .sessions
+            .get(&chat_id)
+            .and_then(|s| s.opencode_server_url.clone());
+        (engine, info, tools, uploads, server_url)
     };
 
     let (session_id, current_path) = match session_info {
@@ -963,9 +1197,14 @@ async fn handle_text_message(
     };
 
     // Build disabled tools notice
-    let default_tools: std::collections::HashSet<&str> = DEFAULT_ALLOWED_TOOLS.iter().copied().collect();
-    let allowed_set: std::collections::HashSet<&str> = allowed_tools.iter().map(|s| s.as_str()).collect();
-    let disabled: Vec<&&str> = default_tools.iter().filter(|t| !allowed_set.contains(**t)).collect();
+    let default_tools: std::collections::HashSet<&str> =
+        DEFAULT_ALLOWED_TOOLS.iter().copied().collect();
+    let allowed_set: std::collections::HashSet<&str> =
+        allowed_tools.iter().map(|s| s.as_str()).collect();
+    let disabled: Vec<&&str> = default_tools
+        .iter()
+        .filter(|t| !allowed_set.contains(**t))
+        .collect();
     let disabled_notice = if disabled.is_empty() {
         String::new()
     } else {
@@ -980,7 +1219,7 @@ async fn handle_text_message(
         )
     };
 
-    // Build system prompt with sendfile instructions
+    // Build system prompt with sendfile instructions (used for Claude backend)
     let system_prompt_owned = format!(
         "You are chatting with a user through Telegram.\n\
          Current working directory: {}\n\n\
@@ -1008,21 +1247,76 @@ async fn handle_text_message(
     // Create channel for streaming
     let (tx, rx) = mpsc::channel();
 
+    // Start OpenCode server if needed (Option B: serve + attach)
+    let mut server_url_for_run: Option<String> = opencode_server_url;
+    if engine == Engine::OpenCode && server_url_for_run.is_none() {
+        // Start server in blocking thread
+        let current_path_clone = current_path.clone();
+        let state_clone = state.clone();
+        let start_res =
+            tokio::task::spawn_blocking(move || opencode::start_server(&current_path_clone))
+                .await
+                .ok()
+                .and_then(|r| r.ok());
+
+        if let Some(server) = start_res {
+            server_url_for_run = Some(server.url.clone());
+            // Persist server info into session
+            let mut data = state_clone.lock().await;
+            let session = data.sessions.entry(chat_id).or_insert_with(|| ChatSession {
+                engine: Engine::Claude,
+                session_id: None,
+                current_path: None,
+                history: Vec::new(),
+                pending_uploads: Vec::new(),
+                opencode_server_url: None,
+                opencode_server_pid: None,
+            });
+            session.opencode_server_url = Some(server.url);
+            session.opencode_server_pid = Some(server.pid);
+        } else {
+            let _ = bot
+                .edit_message_text(chat_id, placeholder_msg_id, "Failed to start OpenCode server. Try /engine claude or check opencode installation.")
+                .await;
+            // Cleanup cancel token
+            let mut data = state.lock().await;
+            data.cancel_tokens.remove(&chat_id);
+            return Ok(());
+        }
+    }
+
+    // Spawn backend runner in a blocking thread
     let session_id_clone = session_id.clone();
     let current_path_clone = current_path.clone();
     let cancel_token_clone = cancel_token.clone();
+    let engine_for_run = engine;
+    let server_url_clone = server_url_for_run.clone();
 
-    // Run Claude in a blocking thread
     tokio::task::spawn_blocking(move || {
-        let result = claude::execute_command_streaming(
-            &context_prompt,
-            session_id_clone.as_deref(),
-            &current_path_clone,
-            tx.clone(),
-            Some(&system_prompt_owned),
-            Some(&allowed_tools),
-            Some(cancel_token_clone),
-        );
+        let result = match engine_for_run {
+            Engine::Claude => claude::execute_command_streaming(
+                &context_prompt,
+                session_id_clone.as_deref(),
+                &current_path_clone,
+                tx.clone(),
+                Some(&system_prompt_owned),
+                Some(&allowed_tools),
+                Some(cancel_token_clone),
+            ),
+            Engine::OpenCode => {
+                let Some(url) = server_url_clone.as_deref() else {
+                    return;
+                };
+                opencode::execute_run_streaming(
+                    &context_prompt,
+                    session_id_clone.as_deref(),
+                    &current_path_clone,
+                    url,
+                    tx.clone(),
+                    Some(cancel_token_clone),
+                )
+            }
+        };
 
         if let Err(e) = result {
             let _ = tx.send(StreamMessage::Error { message: e });
@@ -1036,10 +1330,18 @@ async fn handle_text_message(
     let user_text_owned = user_text.to_string();
     tokio::spawn(async move {
         const SPINNER: &[&str] = &[
-            "🕐 P",           "🕑 Pr",          "🕒 Pro",
-            "🕓 Proc",        "🕔 Proce",       "🕕 Proces",
-            "🕖 Process",     "🕗 Processi",    "🕘 Processin",
-            "🕙 Processing",  "🕚 Processing.", "🕛 Processing..",
+            "🕐 P",
+            "🕑 Pr",
+            "🕒 Pro",
+            "🕓 Proc",
+            "🕔 Proce",
+            "🕕 Proces",
+            "🕖 Process",
+            "🕗 Processi",
+            "🕘 Processin",
+            "🕙 Processing",
+            "🕚 Processing.",
+            "🕛 Processing..",
         ];
         let mut full_response = String::new();
         let mut last_edit_text = String::new();
@@ -1056,7 +1358,9 @@ async fn handle_text_message(
             }
 
             // Send typing action (lasts ~5 seconds, so send periodically)
-            let _ = bot_owned.send_chat_action(chat_id, teloxide::types::ChatAction::Typing).await;
+            let _ = bot_owned
+                .send_chat_action(chat_id, teloxide::types::ChatAction::Typing)
+                .await;
 
             tokio::time::sleep(tokio::time::Duration::from_millis(3000)).await;
 
@@ -1069,59 +1373,61 @@ async fn handle_text_message(
             // Drain all available messages
             loop {
                 match rx.try_recv() {
-                    Ok(msg) => {
-                        match msg {
-                            StreamMessage::Init { session_id: sid } => {
-                                new_session_id = Some(sid);
-                            }
-                            StreamMessage::Text { content } => {
-                                full_response.push_str(&content);
-                            }
-                            StreamMessage::ToolUse { name, input } => {
-                                let summary = format_tool_input(&name, &input);
+                    Ok(msg) => match msg {
+                        StreamMessage::Init { session_id: sid } => {
+                            new_session_id = Some(sid);
+                        }
+                        StreamMessage::Text { content } => {
+                            full_response.push_str(&content);
+                        }
+                        StreamMessage::ToolUse { name, input } => {
+                            let summary = format_tool_input(&name, &input);
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            println!("  [{ts}]   ⚙ {name}: {}", truncate_str(&summary, 80));
+                            full_response.push_str(&format!("\n\n⚙️ {}\n", summary));
+                        }
+                        StreamMessage::ToolResult { content, is_error } => {
+                            if is_error {
                                 let ts = chrono::Local::now().format("%H:%M:%S");
-                                println!("  [{ts}]   ⚙ {name}: {}", truncate_str(&summary, 80));
-                                full_response.push_str(&format!("\n\n⚙️ {}\n", summary));
-                            }
-                            StreamMessage::ToolResult { content, is_error } => {
-                                if is_error {
-                                    let ts = chrono::Local::now().format("%H:%M:%S");
-                                    println!("  [{ts}]   ✗ Error: {}", truncate_str(&content, 80));
-                                    let truncated = truncate_str(&content, 500);
-                                    if truncated.contains('\n') {
-                                        full_response.push_str(&format!("\n❌\n```\n{}\n```\n", truncated));
-                                    } else {
-                                        full_response.push_str(&format!("\n❌ `{}`\n\n", truncated));
-                                    }
-                                } else if !content.is_empty() {
-                                    let truncated = truncate_str(&content, 300);
-                                    if truncated.contains('\n') {
-                                        full_response.push_str(&format!("\n```\n{}\n```\n", truncated));
-                                    } else {
-                                        full_response.push_str(&format!("\n✅ `{}`\n\n", truncated));
-                                    }
+                                println!("  [{ts}]   ✗ Error: {}", truncate_str(&content, 80));
+                                let truncated = truncate_str(&content, 500);
+                                if truncated.contains('\n') {
+                                    full_response
+                                        .push_str(&format!("\n❌\n```\n{}\n```\n", truncated));
+                                } else {
+                                    full_response.push_str(&format!("\n❌ `{}`\n\n", truncated));
                                 }
-                            }
-                            StreamMessage::TaskNotification { summary, .. } => {
-                                if !summary.is_empty() {
-                                    full_response.push_str(&format!("\n[Task: {}]\n", summary));
+                            } else if !content.is_empty() {
+                                let truncated = truncate_str(&content, 300);
+                                if truncated.contains('\n') {
+                                    full_response.push_str(&format!("\n```\n{}\n```\n", truncated));
+                                } else {
+                                    full_response.push_str(&format!("\n✅ `{}`\n\n", truncated));
                                 }
-                            }
-                            StreamMessage::Done { result, session_id: sid } => {
-                                if !result.is_empty() && full_response.is_empty() {
-                                    full_response = result;
-                                }
-                                if let Some(s) = sid {
-                                    new_session_id = Some(s);
-                                }
-                                done = true;
-                            }
-                            StreamMessage::Error { message } => {
-                                full_response = format!("Error: {}", message);
-                                done = true;
                             }
                         }
-                    }
+                        StreamMessage::TaskNotification { summary, .. } => {
+                            if !summary.is_empty() {
+                                full_response.push_str(&format!("\n[Task: {}]\n", summary));
+                            }
+                        }
+                        StreamMessage::Done {
+                            result,
+                            session_id: sid,
+                        } => {
+                            if !result.is_empty() && full_response.is_empty() {
+                                full_response = result;
+                            }
+                            if let Some(s) = sid {
+                                new_session_id = Some(s);
+                            }
+                            done = true;
+                        }
+                        StreamMessage::Error { message } => {
+                            full_response = format!("Error: {}", message);
+                            done = true;
+                        }
+                    },
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         done = true;
@@ -1144,7 +1450,8 @@ async fn handle_text_message(
 
             if display_text != last_edit_text {
                 let html_text = markdown_to_telegram_html(&display_text);
-                if let Err(e) = bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_text)
+                if let Err(e) = bot_owned
+                    .edit_message_text(chat_id, placeholder_msg_id, &html_text)
                     .parse_mode(ParseMode::Html)
                     .await
                 {
@@ -1187,17 +1494,21 @@ async fn handle_text_message(
             // Update placeholder message with partial response instead of deleting
             let html_stopped = markdown_to_telegram_html(&stopped_response);
             if html_stopped.len() <= TELEGRAM_MSG_LIMIT {
-                if let Err(e) = bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_stopped)
+                if let Err(e) = bot_owned
+                    .edit_message_text(chat_id, placeholder_msg_id, &html_stopped)
                     .parse_mode(ParseMode::Html)
                     .await
                 {
                     let ts_err = chrono::Local::now().format("%H:%M:%S");
                     println!("  [{ts_err}]   ⚠ edit_message failed (stopped/HTML): {e}");
-                    let _ = bot_owned.edit_message_text(chat_id, placeholder_msg_id, &stopped_response)
+                    let _ = bot_owned
+                        .edit_message_text(chat_id, placeholder_msg_id, &stopped_response)
                         .await;
                 }
             } else {
-                let send_result = send_long_message(&bot_owned, chat_id, &html_stopped, Some(ParseMode::Html)).await;
+                let send_result =
+                    send_long_message(&bot_owned, chat_id, &html_stopped, Some(ParseMode::Html))
+                        .await;
                 match send_result {
                     Ok(_) => {
                         let _ = bot_owned.delete_message(chat_id, placeholder_msg_id).await;
@@ -1205,14 +1516,16 @@ async fn handle_text_message(
                     Err(e) => {
                         let ts_err = chrono::Local::now().format("%H:%M:%S");
                         println!("  [{ts_err}]   ⚠ send_long_message failed (stopped/HTML): {e}");
-                        let fallback = send_long_message(&bot_owned, chat_id, &stopped_response, None).await;
+                        let fallback =
+                            send_long_message(&bot_owned, chat_id, &stopped_response, None).await;
                         match fallback {
                             Ok(_) => {
                                 let _ = bot_owned.delete_message(chat_id, placeholder_msg_id).await;
                             }
                             Err(_) => {
                                 let truncated = truncate_str(&stopped_response, TELEGRAM_MSG_LIMIT);
-                                let _ = bot_owned.edit_message_text(chat_id, placeholder_msg_id, &truncated)
+                                let _ = bot_owned
+                                    .edit_message_text(chat_id, placeholder_msg_id, &truncated)
                                     .await;
                             }
                         }
@@ -1260,21 +1573,24 @@ async fn handle_text_message(
 
         if html_response.len() <= TELEGRAM_MSG_LIMIT {
             // Try HTML first, fall back to plain text if it fails (e.g. parse error, rate limit)
-            if let Err(e) = bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_response)
+            if let Err(e) = bot_owned
+                .edit_message_text(chat_id, placeholder_msg_id, &html_response)
                 .parse_mode(ParseMode::Html)
                 .await
             {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 println!("  [{ts}]   ⚠ edit_message failed (HTML): {e}");
                 // Fallback: try plain text without HTML parse mode
-                let _ = bot_owned.edit_message_text(chat_id, placeholder_msg_id, &full_response)
+                let _ = bot_owned
+                    .edit_message_text(chat_id, placeholder_msg_id, &full_response)
                     .await;
             }
         } else {
             // For long responses: send new messages FIRST, then delete placeholder.
             // This prevents the scenario where placeholder is deleted but send fails,
             // leaving the user with no response at all.
-            let send_result = send_long_message(&bot_owned, chat_id, &html_response, Some(ParseMode::Html)).await;
+            let send_result =
+                send_long_message(&bot_owned, chat_id, &html_response, Some(ParseMode::Html)).await;
             match send_result {
                 Ok(_) => {
                     // New messages sent successfully, now safe to delete placeholder
@@ -1284,7 +1600,8 @@ async fn handle_text_message(
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     println!("  [{ts}]   ⚠ send_long_message failed (HTML): {e}");
                     // Fallback: try plain text
-                    let fallback_result = send_long_message(&bot_owned, chat_id, &full_response, None).await;
+                    let fallback_result =
+                        send_long_message(&bot_owned, chat_id, &full_response, None).await;
                     match fallback_result {
                         Ok(_) => {
                             let _ = bot_owned.delete_message(chat_id, placeholder_msg_id).await;
@@ -1293,7 +1610,8 @@ async fn handle_text_message(
                             println!("  [{ts}]   ⚠ send_long_message failed (plain): {e2}");
                             // Last resort: edit placeholder with truncated plain text
                             let truncated = truncate_str(&full_response, TELEGRAM_MSG_LIMIT);
-                            let _ = bot_owned.edit_message_text(chat_id, placeholder_msg_id, &truncated)
+                            let _ = bot_owned
+                                .edit_message_text(chat_id, placeholder_msg_id, &truncated)
                                 .await;
                         }
                     }
@@ -1390,7 +1708,9 @@ fn save_session_to_file(session: &ChatSession, current_path: &str) {
     }
 
     // Filter out system messages
-    let saveable_history: Vec<HistoryItem> = session.history.iter()
+    let saveable_history: Vec<HistoryItem> = session
+        .history
+        .iter()
         .filter(|item| !matches!(item.item_type, HistoryType::System))
         .cloned()
         .collect();
@@ -1477,9 +1797,7 @@ async fn send_long_message(
 
         // Find a safe UTF-8 char boundary, then find a newline before it
         let safe_end = floor_char_boundary(remaining, effective_limit);
-        let split_at = remaining[..safe_end]
-            .rfind('\n')
-            .unwrap_or(safe_end);
+        let split_at = remaining[..safe_end].rfind('\n').unwrap_or(safe_end);
 
         let (raw_chunk, rest) = remaining.split_at(split_at);
 
@@ -1602,13 +1920,19 @@ fn markdown_to_telegram_html(md: &str) -> String {
 
         // Unordered list (- or *)
         if trimmed.starts_with("- ") {
-            result.push_str(&format!("• {}", convert_inline(&html_escape(&trimmed[2..]))));
+            result.push_str(&format!(
+                "• {}",
+                convert_inline(&html_escape(&trimmed[2..]))
+            ));
             result.push('\n');
             i += 1;
             continue;
         }
         if trimmed.starts_with("* ") && !trimmed.starts_with("**") {
-            result.push_str(&format!("• {}", convert_inline(&html_escape(&trimmed[2..]))));
+            result.push_str(&format!(
+                "• {}",
+                convert_inline(&html_escape(&trimmed[2..]))
+            ));
             result.push('\n');
             i += 1;
             continue;
@@ -1761,7 +2085,10 @@ fn format_tool_input(name: &str, input: &str) -> String {
         }
         "Edit" => {
             let fp = v.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
-            let replace_all = v.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+            let replace_all = v
+                .get("replace_all")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if replace_all {
                 format!("Edit {} (replace all)", fp)
             } else {
@@ -1792,7 +2119,10 @@ fn format_tool_input(name: &str, input: &str) -> String {
             }
         }
         "NotebookEdit" => {
-            let nb_path = v.get("notebook_path").and_then(|v| v.as_str()).unwrap_or("");
+            let nb_path = v
+                .get("notebook_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let cell_id = v.get("cell_id").and_then(|v| v.as_str()).unwrap_or("");
             if !cell_id.is_empty() {
                 format!("Notebook {} ({})", nb_path, cell_id)
@@ -1810,7 +2140,10 @@ fn format_tool_input(name: &str, input: &str) -> String {
         }
         "Task" => {
             let desc = v.get("description").and_then(|v| v.as_str()).unwrap_or("");
-            let subagent_type = v.get("subagent_type").and_then(|v| v.as_str()).unwrap_or("");
+            let subagent_type = v
+                .get("subagent_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if !subagent_type.is_empty() {
                 format!("Task [{}]: {}", subagent_type, desc)
             } else {
@@ -1827,16 +2160,22 @@ fn format_tool_input(name: &str, input: &str) -> String {
         }
         "TodoWrite" => {
             if let Some(todos) = v.get("todos").and_then(|v| v.as_array()) {
-                let pending = todos.iter().filter(|t| {
-                    t.get("status").and_then(|s| s.as_str()) == Some("pending")
-                }).count();
-                let in_progress = todos.iter().filter(|t| {
-                    t.get("status").and_then(|s| s.as_str()) == Some("in_progress")
-                }).count();
-                let completed = todos.iter().filter(|t| {
-                    t.get("status").and_then(|s| s.as_str()) == Some("completed")
-                }).count();
-                format!("Todo: {} pending, {} in progress, {} completed", pending, in_progress, completed)
+                let pending = todos
+                    .iter()
+                    .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("pending"))
+                    .count();
+                let in_progress = todos
+                    .iter()
+                    .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("in_progress"))
+                    .count();
+                let completed = todos
+                    .iter()
+                    .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("completed"))
+                    .count();
+                format!(
+                    "Todo: {} pending, {} in progress, {} completed",
+                    pending, in_progress, completed
+                )
             } else {
                 "Update todos".to_string()
             }
@@ -1857,12 +2196,8 @@ fn format_tool_input(name: &str, input: &str) -> String {
                 "Ask user question".to_string()
             }
         }
-        "ExitPlanMode" => {
-            "Exit plan mode".to_string()
-        }
-        "EnterPlanMode" => {
-            "Enter plan mode".to_string()
-        }
+        "ExitPlanMode" => "Exit plan mode".to_string(),
+        "EnterPlanMode" => "Enter plan mode".to_string(),
         "TaskCreate" => {
             let subject = v.get("subject").and_then(|v| v.as_str()).unwrap_or("");
             format!("Create task: {}", subject)
@@ -1880,12 +2215,9 @@ fn format_tool_input(name: &str, input: &str) -> String {
             let task_id = v.get("taskId").and_then(|v| v.as_str()).unwrap_or("");
             format!("Get task: {}", task_id)
         }
-        "TaskList" => {
-            "List tasks".to_string()
-        }
+        "TaskList" => "List tasks".to_string(),
         _ => {
             format!("{} {}", name, truncate_str(input, 200))
         }
     }
 }
-
