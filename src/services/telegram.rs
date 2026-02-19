@@ -8,7 +8,9 @@ use std::sync::Arc;
 use reqwest::Url;
 use sha2::{Digest, Sha256};
 use teloxide::prelude::*;
-use teloxide::types::{ButtonRequest, KeyboardButton, KeyboardMarkup, ParseMode, WebAppInfo};
+use teloxide::types::{
+    ButtonRequest, KeyboardButton, KeyboardMarkup, ParseMode, ReplyParameters, WebAppInfo,
+};
 use tokio::sync::Mutex;
 
 use crate::services::claude::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_TOOLS};
@@ -33,6 +35,9 @@ struct ChatSession {
     session_id: Option<String>,
     current_path: Option<String>,
     history: Vec<HistoryItem>,
+    /// Root message id for DM reply-threading.
+    /// When set, the bot should reply to this message id so Telegram groups messages into a thread UI.
+    thread_root_message_id: Option<teloxide::types::MessageId>,
     /// File upload records not yet sent to the agent.
     /// Drained and prepended to the next user prompt so it knows about uploaded files.
     pending_uploads: Vec<String>,
@@ -308,6 +313,7 @@ async fn handle_message(
                         session_id: None,
                         current_path: None,
                         history: Vec::new(),
+                        thread_root_message_id: None,
                         pending_uploads: Vec::new(),
                         opencode_server_url: None,
                         opencode_server_pid: None,
@@ -371,7 +377,7 @@ async fn handle_message(
         handle_down_command(&bot, chat_id, &text, &state).await?;
     } else if text.starts_with("/availabletools") {
         println!("  [{timestamp}] ◀ [{user_name}] /availabletools");
-        handle_availabletools_command(&bot, chat_id).await?;
+        handle_availabletools_command(&bot, chat_id, &state).await?;
     } else if text.starts_with("/allowedtools") {
         println!("  [{timestamp}] ◀ [{user_name}] /allowedtools");
         handle_allowedtools_command(&bot, chat_id, &state).await?;
@@ -412,6 +418,7 @@ async fn handle_app_command(bot: &Bot, chat_id: ChatId, state: &SharedState) -> 
             session_id: None,
             current_path: None,
             history: Vec::new(),
+            thread_root_message_id: None,
             pending_uploads: Vec::new(),
             opencode_server_url: None,
             opencode_server_pid: None,
@@ -496,6 +503,7 @@ async fn handle_web_app_data(
             session_id: None,
             current_path: None,
             history: Vec::new(),
+            thread_root_message_id: None,
             pending_uploads: Vec::new(),
             opencode_server_url: None,
             opencode_server_pid: None,
@@ -589,6 +597,31 @@ async fn handle_start_command(
     // Extract path from "/start <path>"
     let path_str = text.strip_prefix("/start").unwrap_or("").trim();
 
+    // DM reply-threading: /start should create a new thread root each time.
+    // We do this by sending a root message and then replying to it for subsequent bot messages.
+    let thread_root_id = {
+        let engine = {
+            let data = state.lock().await;
+            data.sessions
+                .get(&chat_id)
+                .map(|s| s.engine)
+                .unwrap_or(Engine::OpenCode)
+        };
+        let engine_name = match engine {
+            Engine::Claude => "Claude",
+            Engine::OpenCode => "OpenCode",
+        };
+
+        let label = if path_str.is_empty() {
+            format!("🧵 New Thread: {} @ ~/Projects", engine_name)
+        } else {
+            format!("🧵 New Thread: {} @ {}", engine_name, path_str)
+        };
+
+        let root_msg = bot.send_message(chat_id, label).await?;
+        Some(root_msg.id)
+    };
+
     let canonical_path = if path_str.is_empty() {
         // Default workspace: ~/Projects
         let Some(home) = dirs::home_dir() else {
@@ -646,10 +679,14 @@ async fn handle_start_command(
             session_id: None,
             current_path: None,
             history: Vec::new(),
+            thread_root_message_id: None,
             pending_uploads: Vec::new(),
             opencode_server_url: None,
             opencode_server_pid: None,
         });
+
+        // set/replace thread root for this /start
+        session.thread_root_message_id = thread_root_id;
 
         if let Some((session_data, _)) = &existing {
             session.session_id = Some(session_data.session_id.clone());
@@ -703,7 +740,13 @@ async fn handle_start_command(
     }
 
     let response_text = response_lines.join("\n");
-    send_long_message(bot, chat_id, &response_text, None).await?;
+    let reply_to = {
+        let data = state.lock().await;
+        data.sessions
+            .get(&chat_id)
+            .and_then(|s| s.thread_root_message_id)
+    };
+    send_long_message(bot, chat_id, &response_text, None, reply_to).await?;
 
     Ok(())
 }
@@ -756,6 +799,7 @@ async fn handle_engine_command(
             session_id: None,
             current_path: None,
             history: Vec::new(),
+            thread_root_message_id: None,
             pending_uploads: Vec::new(),
             opencode_server_url: None,
             opencode_server_pid: None,
@@ -1142,13 +1186,23 @@ async fn handle_shell_command(
         Err(e) => format!("Task error: {}", html_escape(&e.to_string())),
     };
 
-    send_long_message(bot, chat_id, &response, Some(ParseMode::Html)).await?;
+    let reply_to = {
+        let data = state.lock().await;
+        data.sessions
+            .get(&chat_id)
+            .and_then(|s| s.thread_root_message_id)
+    };
+    send_long_message(bot, chat_id, &response, Some(ParseMode::Html), reply_to).await?;
 
     Ok(())
 }
 
 /// Handle /availabletools command - show all available tools
-async fn handle_availabletools_command(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
+async fn handle_availabletools_command(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &SharedState,
+) -> ResponseResult<()> {
     let mut msg = String::from("<b>Available Tools</b>\n\n");
 
     for &(name, desc, destructive) in ALL_TOOLS {
@@ -1174,7 +1228,13 @@ async fn handle_availabletools_command(bot: &Bot, chat_id: ChatId) -> ResponseRe
         ALL_TOOLS.len()
     ));
 
-    send_long_message(bot, chat_id, &msg, Some(ParseMode::Html)).await?;
+    let reply_to = {
+        let data = state.lock().await;
+        data.sessions
+            .get(&chat_id)
+            .and_then(|s| s.thread_root_message_id)
+    };
+    send_long_message(bot, chat_id, &msg, Some(ParseMode::Html), reply_to).await?;
 
     Ok(())
 }
@@ -1299,9 +1359,20 @@ async fn handle_allowed_command(
         }
     };
 
-    bot.send_message(chat_id, &response_msg)
-        .parse_mode(ParseMode::Html)
-        .await?;
+    let reply_to = {
+        let data = state.lock().await;
+        data.sessions
+            .get(&chat_id)
+            .and_then(|s| s.thread_root_message_id)
+    };
+
+    let mut req = bot
+        .send_message(chat_id, &response_msg)
+        .parse_mode(ParseMode::Html);
+    if let Some(mid) = reply_to {
+        req = req.reply_parameters(ReplyParameters::new(mid).allow_sending_without_reply());
+    }
+    req.await?;
 
     Ok(())
 }
@@ -1356,8 +1427,20 @@ async fn handle_text_message(
     // It will be added together with the assistant response in the spawned task,
     // only on successful completion. On cancel, nothing is recorded.
 
-    // Send placeholder message
-    let placeholder = bot.send_message(chat_id, "...").await?;
+    // Send placeholder message (threaded if /start created a thread root)
+    let reply_to = {
+        let data = state.lock().await;
+        data.sessions
+            .get(&chat_id)
+            .and_then(|s| s.thread_root_message_id)
+    };
+
+    let mut placeholder_req = bot.send_message(chat_id, "...");
+    if let Some(mid) = reply_to {
+        placeholder_req = placeholder_req
+            .reply_parameters(ReplyParameters::new(mid).allow_sending_without_reply());
+    }
+    let placeholder = placeholder_req.await?;
     let placeholder_msg_id = placeholder.id;
 
     // Sanitize input
@@ -1443,6 +1526,7 @@ async fn handle_text_message(
                 session_id: None,
                 current_path: None,
                 history: Vec::new(),
+                thread_root_message_id: None,
                 pending_uploads: Vec::new(),
                 opencode_server_url: None,
                 opencode_server_pid: None,
@@ -1681,9 +1765,14 @@ async fn handle_text_message(
                         .await;
                 }
             } else {
-                let send_result =
-                    send_long_message(&bot_owned, chat_id, &html_stopped, Some(ParseMode::Html))
-                        .await;
+                let send_result = send_long_message(
+                    &bot_owned,
+                    chat_id,
+                    &html_stopped,
+                    Some(ParseMode::Html),
+                    None,
+                )
+                .await;
                 match send_result {
                     Ok(_) => {
                         let _ = bot_owned.delete_message(chat_id, placeholder_msg_id).await;
@@ -1692,7 +1781,8 @@ async fn handle_text_message(
                         let ts_err = chrono::Local::now().format("%H:%M:%S");
                         println!("  [{ts_err}]   ⚠ send_long_message failed (stopped/HTML): {e}");
                         let fallback =
-                            send_long_message(&bot_owned, chat_id, &stopped_response, None).await;
+                            send_long_message(&bot_owned, chat_id, &stopped_response, None, None)
+                                .await;
                         match fallback {
                             Ok(_) => {
                                 let _ = bot_owned.delete_message(chat_id, placeholder_msg_id).await;
@@ -1764,8 +1854,14 @@ async fn handle_text_message(
             // For long responses: send new messages FIRST, then delete placeholder.
             // This prevents the scenario where placeholder is deleted but send fails,
             // leaving the user with no response at all.
-            let send_result =
-                send_long_message(&bot_owned, chat_id, &html_response, Some(ParseMode::Html)).await;
+            let send_result = send_long_message(
+                &bot_owned,
+                chat_id,
+                &html_response,
+                Some(ParseMode::Html),
+                None,
+            )
+            .await;
             match send_result {
                 Ok(_) => {
                     // New messages sent successfully, now safe to delete placeholder
@@ -1776,7 +1872,7 @@ async fn handle_text_message(
                     println!("  [{ts}]   ⚠ send_long_message failed (HTML): {e}");
                     // Fallback: try plain text
                     let fallback_result =
-                        send_long_message(&bot_owned, chat_id, &full_response, None).await;
+                        send_long_message(&bot_owned, chat_id, &full_response, None, None).await;
                     match fallback_result {
                         Ok(_) => {
                             let _ = bot_owned.delete_message(chat_id, placeholder_msg_id).await;
@@ -1936,11 +2032,15 @@ async fn send_long_message(
     chat_id: ChatId,
     text: &str,
     parse_mode: Option<ParseMode>,
+    reply_to: Option<teloxide::types::MessageId>,
 ) -> ResponseResult<()> {
     if text.len() <= TELEGRAM_MSG_LIMIT {
         let mut req = bot.send_message(chat_id, text);
         if let Some(mode) = parse_mode {
             req = req.parse_mode(mode);
+        }
+        if let Some(mid) = reply_to {
+            req = req.reply_parameters(ReplyParameters::new(mid).allow_sending_without_reply());
         }
         req.await?;
         return Ok(());
@@ -1965,6 +2065,9 @@ async fn send_long_message(
             let mut req = bot.send_message(chat_id, &chunk);
             if let Some(mode) = parse_mode {
                 req = req.parse_mode(mode);
+            }
+            if let Some(mid) = reply_to {
+                req = req.reply_parameters(ReplyParameters::new(mid).allow_sending_without_reply());
             }
             req.await?;
             break;
@@ -2000,6 +2103,9 @@ async fn send_long_message(
         let mut req = bot.send_message(chat_id, &chunk);
         if let Some(mode) = parse_mode {
             req = req.parse_mode(mode);
+        }
+        if let Some(mid) = reply_to {
+            req = req.reply_parameters(ReplyParameters::new(mid).allow_sending_without_reply());
         }
         req.await?;
 
