@@ -290,7 +290,7 @@ async fn handle_message(
                 if Path::new(&last_path).is_dir() {
                     let existing = load_existing_session(&last_path);
                     let session = data.sessions.entry(chat_id).or_insert_with(|| ChatSession {
-                        engine: Engine::Claude,
+                        engine: Engine::OpenCode,
                         session_id: None,
                         current_path: None,
                         history: Vec::new(),
@@ -343,6 +343,9 @@ async fn handle_message(
     } else if text.starts_with("/pwd") {
         println!("  [{timestamp}] ◀ [{user_name}] /pwd");
         handle_pwd_command(&bot, chat_id, &state).await?;
+    } else if text.starts_with("/cmd") {
+        println!("  [{timestamp}] ◀ [{user_name}] /cmd");
+        handle_cmd_command(&bot, chat_id, &text, &state).await?;
     } else if text.starts_with("/down") {
         println!(
             "  [{timestamp}] ◀ [{user_name}] /down {}",
@@ -377,13 +380,13 @@ async fn handle_message(
 async fn handle_help_command(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
     let help = "\
 <b>cokacdir Telegram Bot</b>
-Manage server files &amp; chat with AI (Claude / OpenCode).
+Manage server files &amp; chat with AI (OpenCode default; Claude optional).
 
 <b>Session</b>
 <code>/start &lt;path&gt;</code> — Start session at directory
 <code>/start</code> — Start with auto-generated workspace
+<code>/engine opencode</code> — Use OpenCode backend (serve + attach) [default]
 <code>/engine claude</code> — Use Claude CLI backend
-<code>/engine opencode</code> — Use OpenCode backend (serve + attach)
 <code>/pwd</code> — Show current working directory
 <code>/clear</code> — Clear AI conversation history
 <code>/stop</code> — Stop current AI request
@@ -395,7 +398,8 @@ Send a file/photo — Upload to session directory
 
 <b>Shell</b>
 <code>!&lt;command&gt;</code> — Run shell command directly
-  e.g. <code>!ls -la</code>, <code>!git status</code>
+<code>/cmd &lt;command&gt;</code> — Run shell command (alias)
+  e.g. <code>!ls -la</code>, <code>/cmd git status</code>
 
 <b>AI Chat</b>
 Any other message is sent to Claude AI.
@@ -484,7 +488,7 @@ async fn handle_start_command(
     {
         let mut data = state.lock().await;
         let session = data.sessions.entry(chat_id).or_insert_with(|| ChatSession {
-            engine: Engine::Claude,
+            engine: Engine::OpenCode,
             session_id: None,
             current_path: None,
             history: Vec::new(),
@@ -594,7 +598,7 @@ async fn handle_engine_command(
     {
         let mut data = state.lock().await;
         let session = data.sessions.entry(chat_id).or_insert_with(|| ChatSession {
-            engine: Engine::Claude,
+            engine: Engine::OpenCode,
             session_id: None,
             current_path: None,
             history: Vec::new(),
@@ -885,6 +889,23 @@ async fn handle_file_upload(
     }
 
     Ok(())
+}
+
+/// Handle /cmd <command> - execute shell command (alias of !command)
+async fn handle_cmd_command(
+    bot: &Bot,
+    chat_id: ChatId,
+    text: &str,
+    state: &SharedState,
+) -> ResponseResult<()> {
+    let cmd_str = text.strip_prefix("/cmd").unwrap_or("").trim();
+    if cmd_str.is_empty() {
+        bot.send_message(chat_id, "Usage: /cmd <command>\nExample: /cmd ls -la")
+            .await?;
+        return Ok(());
+    }
+    let bang = format!("!{}", cmd_str);
+    handle_shell_command(bot, chat_id, &bang, state).await
 }
 
 /// Handle !command - execute shell command directly
@@ -1264,7 +1285,7 @@ async fn handle_text_message(
             // Persist server info into session
             let mut data = state_clone.lock().await;
             let session = data.sessions.entry(chat_id).or_insert_with(|| ChatSession {
-                engine: Engine::Claude,
+                engine: Engine::OpenCode,
                 session_id: None,
                 current_path: None,
                 history: Vec::new(),
