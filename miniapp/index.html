@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>cokacdir Mini App</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  </head>
+  <body>
+    <main class="wrap">
+      <h1>cokacdir</h1>
+      <p class="sub">Choose engine and project folder.</p>
+
+      <section class="card">
+        <h2>Engine</h2>
+        <div class="row">
+          <label class="radio">
+            <input type="radio" name="engine" value="opencode" checked />
+            <span>OpenCode</span>
+          </label>
+          <label class="radio">
+            <input type="radio" name="engine" value="claude" />
+            <span>Claude</span>
+          </label>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Folder (~/Projects)</h2>
+        <input id="filter" class="input" placeholder="Filter folders..." />
+        <div id="folders" class="list"></div>
+        <div class="hint" id="hint"></div>
+      </section>
+
+      <button id="start" class="btn" disabled>Start</button>
+      <div class="footer">If the list is empty, create a folder under ~/Projects on the server.</div>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

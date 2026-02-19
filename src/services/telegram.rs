@@ -5,14 +5,21 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 
+use reqwest::Url;
 use sha2::{Digest, Sha256};
 use teloxide::prelude::*;
-use teloxide::types::ParseMode;
+use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, WebAppInfo};
 use tokio::sync::Mutex;
 
 use crate::services::claude::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_TOOLS};
-use crate::services::opencode;
+use crate::services::{miniapp, opencode};
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
+
+fn miniapp_base_url() -> Option<String> {
+    std::env::var("COKACDIR_MINIAPP_URL")
+        .ok()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Engine {
@@ -253,6 +260,13 @@ async fn handle_message(
         .unwrap_or("unknown");
     let timestamp = chrono::Local::now().format("%H:%M:%S");
 
+    // Handle Mini App submissions
+    if let Some(web_app_data) = msg.web_app_data() {
+        println!("  [{timestamp}] ◀ [{user_name}] WebAppData");
+        handle_web_app_data(&bot, chat_id, web_app_data.data.clone(), &state, token).await?;
+        return Ok(());
+    }
+
     // Handle file/photo uploads
     if msg.document().is_some() || msg.photo().is_some() {
         let file_hint = if msg.document().is_some() {
@@ -327,6 +341,9 @@ async fn handle_message(
     } else if text.starts_with("/help") {
         println!("  [{timestamp}] ◀ [{user_name}] /help");
         handle_help_command(&bot, chat_id).await?;
+    } else if text.starts_with("/app") {
+        println!("  [{timestamp}] ◀ [{user_name}] /app");
+        handle_app_command(&bot, chat_id, &state).await?;
     } else if text.starts_with("/start") {
         println!("  [{timestamp}] ◀ [{user_name}] /start");
         handle_start_command(&bot, chat_id, &text, &state, token).await?;
@@ -377,6 +394,145 @@ async fn handle_message(
 }
 
 /// Handle /help command
+async fn handle_app_command(bot: &Bot, chat_id: ChatId, state: &SharedState) -> ResponseResult<()> {
+    let Some(base_url) = miniapp_base_url() else {
+        bot.send_message(
+            chat_id,
+            "Mini App URL is not configured. Set env var COKACDIR_MINIAPP_URL to your Cloudflare Pages URL.",
+        )
+        .await?;
+        return Ok(());
+    };
+
+    // Make sure we have a session object so later WebAppData can bind it
+    {
+        let mut data = state.lock().await;
+        data.sessions.entry(chat_id).or_insert_with(|| ChatSession {
+            engine: Engine::OpenCode,
+            session_id: None,
+            current_path: None,
+            history: Vec::new(),
+            pending_uploads: Vec::new(),
+            opencode_server_url: None,
+            opencode_server_pid: None,
+        });
+    }
+
+    let folders = miniapp::list_project_folders(200);
+    let enc = miniapp::encode_folders_b64(&folders);
+    let url = format!("{}/?folders={}", base_url, enc);
+    let url = match Url::parse(&url) {
+        Ok(u) => u,
+        Err(_) => {
+            bot.send_message(chat_id, "Invalid Mini App URL.").await?;
+            return Ok(());
+        }
+    };
+
+    let keyboard = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::web_app(
+        "Open Mini App".to_string(),
+        WebAppInfo { url },
+    )]]);
+
+    bot.send_message(chat_id, "Open the Mini App to choose engine + folder.")
+        .reply_markup(keyboard)
+        .await?;
+
+    Ok(())
+}
+
+async fn handle_web_app_data(
+    bot: &Bot,
+    chat_id: ChatId,
+    data: String,
+    state: &SharedState,
+    token: &str,
+) -> ResponseResult<()> {
+    #[derive(serde::Deserialize)]
+    struct Payload {
+        engine: Option<String>,
+        folder: Option<String>,
+    }
+
+    let payload: Payload = match serde_json::from_str(&data) {
+        Ok(p) => p,
+        Err(_) => {
+            bot.send_message(chat_id, "Invalid Mini App payload.")
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let engine = match payload.engine.as_deref().unwrap_or("opencode") {
+        "claude" => Engine::Claude,
+        _ => Engine::OpenCode,
+    };
+
+    let folder = match payload.folder {
+        Some(f) => f,
+        None => {
+            bot.send_message(chat_id, "No folder selected.").await?;
+            return Ok(());
+        }
+    };
+
+    let abs_path = match miniapp::folder_name_to_path(&folder) {
+        Ok(p) => p,
+        Err(e) => {
+            bot.send_message(chat_id, format!("Invalid folder: {}", e))
+                .await?;
+            return Ok(());
+        }
+    };
+
+    // Try to load existing session for this path
+    let existing = load_existing_session(&abs_path);
+
+    {
+        let mut data = state.lock().await;
+        let session = data.sessions.entry(chat_id).or_insert_with(|| ChatSession {
+            engine: Engine::OpenCode,
+            session_id: None,
+            current_path: None,
+            history: Vec::new(),
+            pending_uploads: Vec::new(),
+            opencode_server_url: None,
+            opencode_server_pid: None,
+        });
+
+        session.engine = engine;
+        session.current_path = Some(abs_path.clone());
+
+        if let Some((session_data, _)) = &existing {
+            session.session_id = Some(session_data.session_id.clone());
+            session.history = session_data.history.clone();
+        } else {
+            session.session_id = None;
+            session.history.clear();
+        }
+
+        // Persist mapping for auto-restore after restart
+        data.settings
+            .last_sessions
+            .insert(chat_id.0.to_string(), abs_path.clone());
+        save_bot_settings(token, &data.settings);
+    }
+
+    let engine_name = match engine {
+        Engine::Claude => "Claude",
+        Engine::OpenCode => "OpenCode",
+    };
+
+    bot.send_message(
+        chat_id,
+        format!("Session ready. Engine: {}. Path: {}", engine_name, abs_path),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Handle /help command
 async fn handle_help_command(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
     let help = "\
 <b>cokacdir Telegram Bot</b>
@@ -385,6 +541,7 @@ Manage server files &amp; chat with AI (OpenCode default; Claude optional).
 <b>Session</b>
 <code>/start &lt;path&gt;</code> — Start session at directory
 <code>/start</code> — Start in <code>~/Projects</code> (default)
+<code>/app</code> — Open Mini App (engine + folder picker)
 <code>/engine opencode</code> — Use OpenCode backend (serve + attach) [default]
 <code>/engine claude</code> — Use Claude CLI backend
 <code>/pwd</code> — Show current working directory
@@ -402,7 +559,7 @@ Send a file/photo — Upload to session directory
   e.g. <code>!ls -la</code>, <code>/cmd git status</code>
 
 <b>AI Chat</b>
-Any other message is sent to Claude AI.
+Any other message is sent to the selected AI engine (default: OpenCode).
 AI can read, edit, and run commands in your session.
 
 <b>Tool Management</b>
