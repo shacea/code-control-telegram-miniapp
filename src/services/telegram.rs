@@ -384,7 +384,7 @@ Manage server files &amp; chat with AI (OpenCode default; Claude optional).
 
 <b>Session</b>
 <code>/start &lt;path&gt;</code> — Start session at directory
-<code>/start</code> — Start with auto-generated workspace
+<code>/start</code> — Start in <code>~/Projects</code> (default)
 <code>/engine opencode</code> — Use OpenCode backend (serve + attach) [default]
 <code>/engine claude</code> — Use Claude CLI backend
 <code>/pwd</code> — Show current working directory
@@ -432,26 +432,22 @@ async fn handle_start_command(
     let path_str = text.strip_prefix("/start").unwrap_or("").trim();
 
     let canonical_path = if path_str.is_empty() {
-        // Create random workspace directory
+        // Default workspace: ~/Projects
         let Some(home) = dirs::home_dir() else {
             bot.send_message(chat_id, "Error: cannot determine home directory.")
                 .await?;
             return Ok(());
         };
-        let workspace_dir = home.join(".cokacdir").join("workspace");
-        use rand::Rng;
-        let random_name: String = rand::thread_rng()
-            .sample_iter(&rand::distributions::Alphanumeric)
-            .take(8)
-            .map(|b| (b as char).to_ascii_lowercase())
-            .collect();
-        let new_dir = workspace_dir.join(&random_name);
-        if let Err(e) = fs::create_dir_all(&new_dir) {
-            bot.send_message(chat_id, format!("Error: failed to create workspace: {}", e))
-                .await?;
+        let projects_dir = home.join("Projects");
+        if let Err(e) = fs::create_dir_all(&projects_dir) {
+            bot.send_message(
+                chat_id,
+                format!("Error: failed to create ~/Projects: {}", e),
+            )
+            .await?;
             return Ok(());
         }
-        new_dir.display().to_string()
+        projects_dir.display().to_string()
     } else {
         // Expand ~ to home directory
         let expanded = if path_str.starts_with("~/") || path_str == "~" {
