@@ -104,8 +104,8 @@ pub fn start_server(working_dir: &str) -> Result<OpenCodeServer, String> {
 
     let mut url: Option<String> = None;
 
-    // Wait up to ~5 seconds for the URL.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // Wait up to ~20 seconds for the URL (first startup can be slow on some machines).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     while std::time::Instant::now() < deadline {
         if let Ok(line) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
             // Typical: "opencode server listening on http://127.0.0.1:4096"
