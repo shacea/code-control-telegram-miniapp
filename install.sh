@@ -1,13 +1,12 @@
 #!/bin/bash
 #
-# COKACDIR Installer
-# Usage: curl -fsSL https://cokacdir.cokac.com/install.sh | bash
+# code-control-telegram Installer
 #
 
 set -e
 
-BINARY_NAME="cokacdir"
-BASE_URL="https://cokacdir.cokac.com/dist"
+BINARY_NAME="code-control-telegram"
+BASE_URL="https://github.com/shacea/code-control-telegram-miniapp/releases/latest/download"
 
 # Colors
 RED='\033[0;31m'
@@ -87,7 +86,7 @@ download() {
 }
 
 # Shell wrapper function to add
-SHELL_FUNC='cokacdir() { command cokacdir "$@" && cd "$(cat ~/.cokacdir/lastdir 2>/dev/null || pwd)"; }'
+SHELL_FUNC='code-control-telegram() { command code-control-telegram "$@" && cd "$(cat ~/.code-control-telegram/lastdir 2>/dev/null || pwd)"; }'
 
 # Get shell config file
 get_shell_config() {
@@ -123,7 +122,7 @@ setup_shell() {
     fi
 
     # Check if already configured
-    if [ -f "$config_file" ] && grep -q "cokacdir()" "$config_file"; then
+    if [ -f "$config_file" ] && grep -q "code-control-telegram()" "$config_file"; then
         return
     fi
 
@@ -134,7 +133,7 @@ setup_shell() {
 
     # Add function
     echo "" >> "$config_file"
-    echo "# cokacdir - cd to last directory on exit" >> "$config_file"
+    echo "# code-control-telegram - cd to last directory on exit" >> "$config_file"
     echo "$SHELL_FUNC" >> "$config_file"
 }
 
@@ -144,7 +143,7 @@ main() {
     os="$(detect_os)"
     arch="$(detect_arch)"
 
-    info "Downloading cokacdir ($os-$arch)..."
+    info "Downloading code-control-telegram ($os-$arch)..."
 
     # Build download URL
     local filename="${BINARY_NAME}-${os}-${arch}"
@@ -185,7 +184,7 @@ main() {
         # Setup shell wrapper
         setup_shell
 
-        success "Installed! Run 'cokacdir' to start."
+        success "Installed! Run 'code-control-telegram' to start."
     else
         error "Installation failed"
     fi

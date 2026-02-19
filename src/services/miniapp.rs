@@ -53,9 +53,7 @@ pub fn validate_projects_subdir(path: &str) -> Result<String, String> {
     let _ = fs::create_dir_all(&projects);
 
     let p = Path::new(path);
-    let canon = p
-        .canonicalize()
-        .map_err(|e| format!("invalid path: {e}"))?;
+    let canon = p.canonicalize().map_err(|e| format!("invalid path: {e}"))?;
 
     let projects_canon = projects
         .canonicalize()

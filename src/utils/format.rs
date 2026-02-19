@@ -1,5 +1,5 @@
 // === UTF-8 safe string slicing utilities ===
-use unicode_width::{UnicodeWidthStr, UnicodeWidthChar};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Byte index를 가장 가까운 char boundary로 내림
 pub fn floor_char_boundary(s: &str, index: usize) -> usize {

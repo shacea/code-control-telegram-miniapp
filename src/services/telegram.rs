@@ -18,7 +18,14 @@ use crate::services::{miniapp, opencode};
 use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
 
 fn miniapp_base_url() -> Option<String> {
-    std::env::var("COKACDIR_MINIAPP_URL")
+    std::env::var("CODE_CONTROL_TELEGRAM_MINIAPP_URL")
+        .or_else(|_| {
+            let val = std::env::var("COKACDIR_MINIAPP_URL");
+            if val.is_ok() {
+                eprintln!("[DEPRECATED] legacy MINIAPP_URL env var is deprecated; use CODE_CONTROL_TELEGRAM_MINIAPP_URL");
+            }
+            val
+        })
         .ok()
         .map(|s| s.trim().trim_end_matches('/').to_string())
 }
@@ -89,9 +96,8 @@ fn token_hash(token: &str) -> String {
     hex::encode(&result[..8]) // 16 hex chars
 }
 
-/// Path to bot settings file: ~/.cokacdir/bot_settings.json
 fn bot_settings_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".cokacdir").join("bot_settings.json"))
+    dirs::home_dir().map(|h| h.join(".code-control-telegram").join("bot_settings.json"))
 }
 
 /// Load bot settings from bot_settings.json
@@ -404,7 +410,7 @@ async fn handle_app_command(bot: &Bot, chat_id: ChatId, state: &SharedState) -> 
     let Some(base_url) = miniapp_base_url() else {
         bot.send_message(
             chat_id,
-            "Mini App URL is not configured. Set env var COKACDIR_MINIAPP_URL to your Cloudflare Pages URL.",
+            "Mini App URL is not configured. Set env var CODE_CONTROL_TELEGRAM_MINIAPP_URL to your Cloudflare Pages URL.",
         )
         .await?;
         return Ok(());
@@ -544,7 +550,7 @@ async fn handle_web_app_data(
 /// Handle /help command
 async fn handle_help_command(bot: &Bot, chat_id: ChatId) -> ResponseResult<()> {
     let help = "\
-<b>cokacdir Telegram Bot</b>
+<b>code-control-telegram Bot</b>
 Manage server files &amp; chat with AI (OpenCode default; Claude optional).
 
 <b>Session</b>
@@ -1483,7 +1489,7 @@ async fn handle_text_message(
          Current working directory: {}\n\n\
          When your work produces a file the user would want (generated code, reports, images, archives, etc.),\n\
          send it by running this bash command:\n\n\
-         cokacdir --sendfile <filepath> --chat {} --key {}\n\n\
+         code-control-telegram --sendfile <filepath> --chat {} --key {}\n\n\
          This delivers the file directly to the user's Telegram chat.\n\
          Do NOT tell the user to use /down — use the command above instead.\n\n\
          Always keep the user informed about what you are doing. \

@@ -1,4 +1,4 @@
-# cokacdir Mini App (Option A)
+# code-control-telegram Mini App (Option A)
 
 Static Telegram Mini App used only for **session start UX**:
 
@@ -18,7 +18,7 @@ Static Telegram Mini App used only for **session start UX**:
 Set env var when running the ccserver:
 
 ```bash
-export COKACDIR_MINIAPP_URL="https://<your-project>.pages.dev"
+export CODE_CONTROL_TELEGRAM_MINIAPP_URL="https://<your-project>.pages.dev"
 ```
 
 Then in Telegram:
